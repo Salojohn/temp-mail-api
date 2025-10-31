@@ -1,0 +1,10 @@
+{
+  "name": "tempmail-smtp",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "ioredis": "^5.4.1",
+    "mailparser": "^3.9.0",
+    "smtp-server": "^3.13.4"
+  }
+}

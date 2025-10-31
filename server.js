@@ -5,55 +5,14 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { SMTPServer } from "smtp-server";
 import { simpleParser } from "mailparser";
-import Redis from "ioredis";
+import { redis } from "./redisClient.js";
 
 /* ======================= Config ======================= */
-const WEB_PORT = process.env.PORT || 3000;
-const SMTP_PORT = process.env.SMTP_PORT || 2525; // Render δεν εκθέτει 25
-const DEV_MODE = process.env.DEV_MODE === "1";
+const WEB_PORT  = process.env.PORT || 3000;
+const SMTP_PORT = process.env.SMTP_PORT || 2525;  // Render δεν εκθέτει 25
+const DEV_MODE  = process.env.DEV_MODE === "1";
 const INBOX_TTL = Number(process.env.INBOX_TTL || 600); // sec
-const MSG_TTL = Number(process.env.MSG_TTL || 600);     // sec
-
-/* ================== Redis (stable client) ============== */
-const redisUrl = process.env.REDIS_URL || "redis://127.0.0.1:6379";
-const useTls = redisUrl.startsWith("rediss://");
-
-const redis = new Redis(redisUrl, {
-  ...(useTls ? { tls: {} } : {}),
-  maxRetriesPerRequest: null,                         // μην πετάς MaxRetriesPerRequestError
-  retryStrategy: (times) => Math.min(times * 200, 2000),
-  keepAlive: 10000,
-  connectTimeout: 10000,
-  enableReadyCheck: false,
-  reconnectOnError: (err) =>
-    /READONLY|ECONNRESET|EPIPE|Connection is closed/i.test(err?.message || "")
-});
-
-let firstConnect = true;
-let lastWarn = 0;
-redis.on("connect", () => {
-  if (firstConnect) {
-    console.log("[redis] connected");
-    firstConnect = false;
-  }
-});
-redis.on("reconnecting", (ms) => {
-  const now = Date.now();
-  if (now - lastWarn > 60000) {
-    console.warn(`[redis] reconnecting in ${ms}ms`);
-    lastWarn = now;
-  }
-});
-redis.on("end", () => console.warn("[redis] connection closed"));
-redis.on("error", (e) => {
-  const now = Date.now();
-  if (now - lastWarn > 60000) {
-    console.warn("[redis] transient issue:", e.code || e.message);
-    lastWarn = now;
-  }
-});
-// keep-alive ping για free plans
-setInterval(() => { redis.ping().catch(() => {}); }, 20000);
+const MSG_TTL   = Number(process.env.MSG_TTL   || 600); // sec
 
 /* ================ Helpers: keys & storage ============== */
 const mailboxKey = (email) => `mailbox:${email.toLowerCase()}`;
@@ -63,15 +22,19 @@ async function storeMessage(toEmail, record) {
   const mKey = messageKey(record.id);
   const listKey = mailboxKey(toEmail);
 
-  await redis.set(mKey, JSON.stringify(record), "EX", MSG_TTL); // σώσε σώμα msg με TTL
-  await redis.lpush(listKey, record.id);                         // index ανά inbox
-  await redis.ltrim(listKey, 0, 199);                            // κράτα 200 ids
-  await redis.expire(listKey, INBOX_TTL);                        // TTL στο inbox
+  // Σώσε το πλήρες μήνυμα με TTL
+  await redis.set(mKey, JSON.stringify(record), "EX", MSG_TTL);
+
+  // Index στο mailbox list
+  await redis.lpush(listKey, record.id);
+  await redis.ltrim(listKey, 0, 199);      // κράτα 200 ids
+  await redis.expire(listKey, INBOX_TTL);  // TTL στο inbox list
 }
 
 /* ================= HTTP server (health & API) ========== */
 const app = express();
 app.disable("x-powered-by");
+
 app.use(helmet());
 app.use(cors());
 app.use(bodyParser.json({ limit: "1mb" }));
@@ -128,7 +91,7 @@ app.delete("/messages/:mailbox", async (req, res) => {
   }
 });
 
-// Test endpoints (μόνο σε DEV_MODE=1)
+// Test endpoints (ΜΟΝΟ αν DEV_MODE=1)
 if (DEV_MODE) {
   app.get("/_test/push", async (req, res) => {
     try {
@@ -162,7 +125,7 @@ if (DEV_MODE) {
         html: req.body.html || "",
         date: new Date().toISOString()
       };
-      await storeMessage(to, record);
+    await storeMessage(to, record);
       res.json({ ok: true, stored: record });
     } catch (e) {
       console.error("[test] push error:", e);

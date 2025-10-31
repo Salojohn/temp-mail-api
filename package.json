@@ -13,9 +13,10 @@
     "express-rate-limit": "^7.4.0",
     "helmet": "^7.0.0",
     "ioredis": "^5.4.1",
-    "mailparser": "^3.7.4"
+    "mailparser": "^3.7.4",
+    "smtp-server": "^3.13.4"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": "20.x"
   }
 }

@@ -1,74 +1,100 @@
+import express from "express";
+import bodyParser from "body-parser";
+import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import { SMTPServer } from "smtp-server";
 import { simpleParser } from "mailparser";
 import Redis from "ioredis";
-import crypto from "crypto";
 
-const DOMAIN = (process.env.DOMAIN || "localhost").toLowerCase();
-const MSG_TTL = parseInt(process.env.MSG_TTL || "600", 10);
-const redis = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379");
+/* ------------ Redis connection ------------ */
+const redisUrl = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+const useTls = redisUrl.startsWith("rediss://");
+const redis = new Redis(redisUrl, useTls ? { tls: {} } : {});
+redis.on("connect", () => console.log("[redis] connected"));
+redis.on("error", (e) => console.error("[redis] error:", e));
 
-function isOurDomain(address) {
-    if (!address) return false;
-    const [, domain] = String(address).toLowerCase().split("@");
-    return domain === DOMAIN;
-}
+/* ------------ HTTP (health/API) ------------ */
+/* Στο Render ΠΡΕΠΕΙ να ακούς στο PORT για να θεωρηθεί “healthy” το service */
+const app = express();
+const WEB_PORT = process.env.PORT || 3000;
 
-async function inboxExists(local) {
-    return !!(await redis.get(`inbox:${local}`));
-}
+app.use(helmet());
+app.use(cors());
+app.use(bodyParser.json());
+app.use(
+  rateLimit({
+    windowMs: 60 * 1000,
+    limit: 120,
+    standardHeaders: true,
+    legacyHeaders: false,
+  })
+);
 
-const server = new SMTPServer({
-    disabledCommands: ["AUTH"], // μόνο εισερχόμενα
-    logger: false,
-    onRcptTo(address, session, callback) {
-        if (!isOurDomain(address.address)) {
-            return callback(new Error("550 Relaying denied"));
-        }
-        callback(); // OK
-    },
-    async onData(stream, session, callback) {
-        try {
-            const parsed = await simpleParser(stream);
+app.get("/", (_req, res) => res.send("OK"));
+app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
-            // valid recipient του domain μας
-            const rcpt = (session.envelope.rcptTo || [])
-                .map(r => r.address)
-                .find(isOurDomain);
-            if (!rcpt) return callback(new Error("550 No valid recipient"));
-
-            const local = rcpt.split("@")[0]?.replace(/[^a-z0-9]/gi, "").toLowerCase();
-            if (!local || !(await inboxExists(local))) {
-                // drop ήρεμα για άγνωστα/ληγμένα inboxes
-                return callback();
-            }
-
-            const id = crypto.randomBytes(8).toString("hex");
-            const msg = {
-                id,
-                from: parsed.from?.text || session.envelope.mailFrom?.address || "",
-                to: rcpt,
-                subject: parsed.subject || "(no subject)",
-                body_plain: parsed.text || "",
-                body_html: parsed.html || "",
-                attachments: (parsed.attachments || []).map(a => ({
-                    filename: a.filename, contentType: a.contentType, size: a.size
-                })),
-                received_at: Date.now()
-            };
-
-            await redis.set(`msg:${id}`, JSON.stringify(msg), "EX", MSG_TTL);
-            await redis.lpush(`msgs:${local}`, id);
-            await redis.expire(`msgs:${local}`, MSG_TTL);
-
-            callback(); // 250 OK
-        } catch (e) {
-            console.error("SMTP onData error:", e);
-            callback(new Error("451 Temporary error"));
-        }
-    },
-    size: 10 * 1024 * 1024 // 10MB όριο
+/* Ενδεικτικό endpoint για ανάγνωση μηνυμάτων από Redis */
+app.get("/messages/:mailbox", async (req, res) => {
+  try {
+    const key = `mailbox:${req.params.mailbox.toLowerCase()}`;
+    const items = await redis.lrange(key, 0, 49); // latest 50
+    const list = items.map((s) => JSON.parse(s));
+    res.json({ mailbox: req.params.mailbox, count: list.length, items: list });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Failed to fetch messages" });
+  }
 });
 
-server.listen(25, () => {
-    console.log(`SMTP server for ${DOMAIN} listening on :25`);
+app.listen(WEB_PORT, () => {
+  console.log(`[http] listening on :${WEB_PORT}`);
+});
+
+/* ------------ SMTP server ------------ */
+/* Σημείωση: Το Render δεν κάνει proxy SMTP/25 προς τα έξω.
+   Μπορείς όμως να δέσεις σε δικό σου port (π.χ. 2525) για internal χρήση/testing.
+   Για πραγματικό public SMTP ingress θέλει TCP service σε άλλο provider. */
+const SMTP_PORT = process.env.SMTP_PORT || 2525;
+
+const smtp = new SMTPServer({
+  disabledCommands: ["AUTH"], // απλό demo: χωρίς auth
+  logger: false,
+  onData(stream, session, callback) {
+    simpleParser(stream)
+      .then(async (mail) => {
+        try {
+          // Χρησιμοποιούμε το πρώτο recipient σαν mailbox key
+          const to = (mail.to?.value?.[0]?.address || "unknown").toLowerCase();
+          const key = `mailbox:${to}`;
+
+          const record = {
+            id: Date.now().toString(36),
+            from: mail.from?.text || "",
+            to: mail.to?.text || "",
+            subject: mail.subject || "",
+            date: mail.date || new Date().toISOString(),
+            text: mail.text || "",
+            html: mail.html || "",
+            headers: Object.fromEntries(mail.headerLines?.map(h => [h.key, h.line]) || []),
+          };
+
+          await redis.lpush(key, JSON.stringify(record));
+          await redis.ltrim(key, 0, 199); // κράτα μέχρι 200 μηνύματα ανά mailbox
+          console.log(`[smtp] stored message for ${to}`);
+          callback();
+        } catch (e) {
+          console.error("[smtp] store error:", e);
+          callback(e);
+        }
+      })
+      .catch((err) => {
+        console.error("[smtp] parse error:", err);
+        callback(err);
+      });
+  },
+});
+
+smtp.listen(SMTP_PORT, "0.0.0.0", () => {
+  console.log(`[smtp] listening on :${SMTP_PORT}`);
 });

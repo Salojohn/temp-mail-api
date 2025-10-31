@@ -7,40 +7,38 @@ import { SMTPServer } from "smtp-server";
 import { simpleParser } from "mailparser";
 import Redis from "ioredis";
 
-/* ------------ Redis connection (stable) ------------ */
+/* ------------ Redis connection (stable + quiet logs) ------------ */
 const redisUrl = process.env.REDIS_URL || "redis://127.0.0.1:6379";
 const useTls = redisUrl.startsWith("rediss://");
 
 const redis = new Redis(redisUrl, {
   ...(useTls ? { tls: {} } : {}),
-
-  // Μην πετάει MaxRetriesPerRequestError για εκκρεμή αιτήματα
   maxRetriesPerRequest: null,
-
-  // Reconnect backoff: 200ms, 400ms, ... έως 2000ms
   retryStrategy: (times) => Math.min(times * 200, 2000),
-
-  // Κράτα ζωντανή τη σύνδεση & βάλε έγκαιρα timeouts
   keepAlive: 10000,
   connectTimeout: 10000,
-
-  // Σε managed providers βοηθά να είναι off
   enableReadyCheck: false,
-
-  // Ζήτα reconnect σε συγκεκριμένα σφάλματα
   reconnectOnError: (err) => /READONLY|ECONNRESET|EPIPE/i.test(err?.message || "")
 });
 
 redis.on("connect", () => console.log("[redis] connected"));
-redis.on("error", (e) => console.error("[redis] error:", e));
 
-// Ping κάθε 30s ώστε οι free providers να μη θεωρούν τη σύνδεση idle
+// Περιορίζει τα error logs (μία φορά το λεπτό max)
+let lastWarn = 0;
+redis.on("error", (e) => {
+  const now = Date.now();
+  if (now - lastWarn > 60000) {
+    console.warn("[redis] transient issue:", e.code || e.message);
+    lastWarn = now;
+  }
+});
+
+// Ping κάθε 30s για να μη γίνεται idle disconnect
 setInterval(() => {
   redis.ping().catch(() => {});
 }, 30000);
 
 /* ------------ HTTP (health/API) ------------ */
-// Στο Render ΠΡΕΠΕΙ να ακούς στο PORT για να θεωρηθεί “healthy” το service
 const app = express();
 const WEB_PORT = process.env.PORT || 3000;
 
@@ -52,18 +50,18 @@ app.use(
     windowMs: 60 * 1000,
     limit: 120,
     standardHeaders: true,
-    legacyHeaders: false,
+    legacyHeaders: false
   })
 );
 
 app.get("/", (_req, res) => res.send("OK"));
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
-// Ενδεικτικό endpoint για ανάγνωση μηνυμάτων από Redis
+// Λίστα τελευταίων 50 emails από mailbox
 app.get("/messages/:mailbox", async (req, res) => {
   try {
     const key = `mailbox:${req.params.mailbox.toLowerCase()}`;
-    const items = await redis.lrange(key, 0, 49); // latest 50
+    const items = await redis.lrange(key, 0, 49);
     const list = items.map((s) => JSON.parse(s));
     res.json({ mailbox: req.params.mailbox, count: list.length, items: list });
   } catch (e) {
@@ -72,25 +70,35 @@ app.get("/messages/:mailbox", async (req, res) => {
   }
 });
 
-app.listen(WEB_PORT, () => {
+// Διαγραφή mailbox
+app.delete("/messages/:mailbox", async (req, res) => {
+  try {
+    const key = `mailbox:${req.params.mailbox.toLowerCase()}`;
+    await redis.del(key);
+    res.json({ mailbox: req.params.mailbox, deleted: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Failed to delete mailbox" });
+  }
+});
+
+const httpServer = app.listen(WEB_PORT, () => {
   console.log(`[http] listening on :${WEB_PORT}`);
 });
 
 /* ------------ SMTP server ------------ */
-/* Σημείωση: Το Render δεν κάνει proxy SMTP/25 από έξω.
-   Δένουμε σε μη-privileged port (π.χ. 2525) για internal χρήση/testing.
-   Για πραγματικό public SMTP ingress χρειάζεται TCP service σε άλλον provider. */
+// Το Render δεν κάνει proxy στο port 25, γι' αυτό 2525 για internal testing
 const SMTP_PORT = process.env.SMTP_PORT || 2525;
 
 const smtp = new SMTPServer({
-  disabledCommands: ["AUTH"], // demo: χωρίς auth
+  disabledCommands: ["AUTH"], // demo χωρίς authentication
   logger: false,
   onData(stream, session, callback) {
     simpleParser(stream)
       .then(async (mail) => {
         try {
-          // Χρησιμοποίησε τον πρώτο recipient ως mailbox key
-          const to = (mail.to?.value?.[0]?.address || "unknown").toLowerCase();
+          const toAddr = mail.to?.value?.[0]?.address || "unknown";
+          const to = toAddr.toLowerCase();
           const key = `mailbox:${to}`;
 
           const record = {
@@ -101,14 +109,13 @@ const smtp = new SMTPServer({
             date: mail.date || new Date().toISOString(),
             text: mail.text || "",
             html: mail.html || "",
-            headers:
-              Object.fromEntries(
-                (mail.headerLines || []).map((h) => [h.key, h.line])
-              ) || {},
+            headers: Object.fromEntries(
+              (mail.headerLines || []).map((h) => [h.key, h.line])
+            )
           };
 
           await redis.lpush(key, JSON.stringify(record));
-          await redis.ltrim(key, 0, 199); // κράτα μέχρι 200/mbox
+          await redis.ltrim(key, 0, 199); // κράτα 200 max ανά mailbox
           console.log(`[smtp] stored message for ${to}`);
           callback();
         } catch (e) {
@@ -120,9 +127,26 @@ const smtp = new SMTPServer({
         console.error("[smtp] parse error:", err);
         callback(err);
       });
-  },
+  }
 });
 
 smtp.listen(SMTP_PORT, "0.0.0.0", () => {
   console.log(`[smtp] listening on :${SMTP_PORT}`);
 });
+
+/* ------------ Graceful shutdown ------------ */
+function shutdown(signal) {
+  console.log(`[sys] ${signal} received, shutting down...`);
+  try {
+    smtp.close();
+  } catch {}
+  try {
+    httpServer.close(() => console.log("[http] closed"));
+  } catch {}
+  try {
+    redis.quit().catch(() => redis.disconnect());
+  } catch {}
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));

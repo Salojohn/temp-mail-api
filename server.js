@@ -21,10 +21,35 @@ const redis = new Redis(redisUrl, {
   reconnectOnError: (err) => /READONLY|ECONNRESET|EPIPE/i.test(err?.message || "")
 });
 
-redis.on("connect", () => console.log("[redis] connected"));
-
-// Περιορίζει τα error logs (μία φορά το λεπτό max)
+let firstConnect = true;
 let lastWarn = 0;
+const LOG_REDIS = process.env.LOG_REDIS === "1";
+
+redis.on("connect", () => {
+  if (firstConnect) {
+    console.log("[redis] connected");
+    firstConnect = false;
+  } else if (LOG_REDIS) {
+    console.log("[redis] reconnected");
+  }
+});
+
+redis.on("ready", () => {
+  if (LOG_REDIS) console.log("[redis] ready");
+});
+
+redis.on("reconnecting", (ms) => {
+  const now = Date.now();
+  if (now - lastWarn > 60000) {
+    console.warn(`[redis] reconnecting in ${ms}ms`);
+    lastWarn = now;
+  }
+});
+
+redis.on("end", () => {
+  console.warn("[redis] connection closed");
+});
+
 redis.on("error", (e) => {
   const now = Date.now();
   if (now - lastWarn > 60000) {
@@ -33,12 +58,12 @@ redis.on("error", (e) => {
   }
 });
 
-// Ping κάθε 30s για να μη γίνεται idle disconnect
+// Ping συχνά για να αποφεύγονται idle disconnects σε free plans
 setInterval(() => {
   redis.ping().catch(() => {});
-}, 30000);
+}, 20000);
 
-/* ------------ HTTP (health/API) ------------ */
+/* ------------ HTTP (health & API) ------------ */
 const app = express();
 const WEB_PORT = process.env.PORT || 3000;
 
@@ -57,7 +82,7 @@ app.use(
 app.get("/", (_req, res) => res.send("OK"));
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
-// Λίστα τελευταίων 50 emails από mailbox
+// Λήψη τελευταίων 50 emails από mailbox
 app.get("/messages/:mailbox", async (req, res) => {
   try {
     const key = `mailbox:${req.params.mailbox.toLowerCase()}`;
@@ -86,12 +111,12 @@ const httpServer = app.listen(WEB_PORT, () => {
   console.log(`[http] listening on :${WEB_PORT}`);
 });
 
-/* ------------ SMTP server ------------ */
-// Το Render δεν κάνει proxy στο port 25, γι' αυτό 2525 για internal testing
+/* ------------ SMTP server (store to Redis) ------------ */
+// Render δεν κάνει proxy SMTP/25. Χρησιμοποιούμε 2525 για internal/testing.
 const SMTP_PORT = process.env.SMTP_PORT || 2525;
 
 const smtp = new SMTPServer({
-  disabledCommands: ["AUTH"], // demo χωρίς authentication
+  disabledCommands: ["AUTH"], // demo χωρίς auth
   logger: false,
   onData(stream, session, callback) {
     simpleParser(stream)
@@ -116,7 +141,7 @@ const smtp = new SMTPServer({
 
           await redis.lpush(key, JSON.stringify(record));
           await redis.ltrim(key, 0, 199); // κράτα 200 max ανά mailbox
-          console.log(`[smtp] stored message for ${to}`);
+          if (LOG_REDIS) console.log(`[smtp] stored message for ${to}`);
           callback();
         } catch (e) {
           console.error("[smtp] store error:", e);
@@ -137,15 +162,9 @@ smtp.listen(SMTP_PORT, "0.0.0.0", () => {
 /* ------------ Graceful shutdown ------------ */
 function shutdown(signal) {
   console.log(`[sys] ${signal} received, shutting down...`);
-  try {
-    smtp.close();
-  } catch {}
-  try {
-    httpServer.close(() => console.log("[http] closed"));
-  } catch {}
-  try {
-    redis.quit().catch(() => redis.disconnect());
-  } catch {}
+  try { smtp.close(); } catch {}
+  try { httpServer.close(() => console.log("[http] closed")); } catch {}
+  try { redis.quit().catch(() => redis.disconnect()); } catch {}
 }
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));

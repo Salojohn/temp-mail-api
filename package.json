@@ -1,10 +1,21 @@
 {
-  "name": "tempmail-smtp",
+  "name": "tempmail-api",
   "version": "1.0.0",
   "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
+    "body-parser": "^1.20.2",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^7.0.0",
     "ioredis": "^5.4.1",
-    "mailparser": "^3.7.4",
-    "smtp-server": "^3.13.4"
+    "mailparser": "^3.7.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }

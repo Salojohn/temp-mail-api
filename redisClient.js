@@ -38,12 +38,12 @@ redis.on("error", (e) => {
   }
 });
 
-// keep-alive για free plans
+// keep-alive (free plans)
 setInterval(() => {
   redis.ping().catch(() => {});
 }, 20000);
 
-// soft-guard
+// soft-guards
 process.on("unhandledRejection", (e) =>
   console.warn("[sys] unhandledRejection:", e?.message || e)
 );

@@ -22,13 +22,13 @@ async function storeMessage(toEmail, record) {
   const mKey = messageKey(record.id);
   const listKey = mailboxKey(toEmail);
 
-  // Σώσε το πλήρες μήνυμα με TTL
-  await redis.set(mKey, JSON.stringify(record), "EX", MSG_TTL);
-
-  // Index στο mailbox list
-  await redis.lpush(listKey, record.id);
-  await redis.ltrim(listKey, 0, 199);      // κράτα 200 ids
-  await redis.expire(listKey, INBOX_TTL);  // TTL στο inbox list
+  // pipeline για ταχύτητα/αντοχή
+  const pipe = redis.pipeline();
+  pipe.set(mKey, JSON.stringify(record), "EX", MSG_TTL);
+  pipe.lpush(listKey, record.id);
+  pipe.ltrim(listKey, 0, 199);
+  pipe.expire(listKey, INBOX_TTL);
+  await pipe.exec();
 }
 
 /* ================= HTTP server (health & API) ========== */
@@ -45,11 +45,12 @@ app.use(rateLimit({
   legacyHeaders: false
 }));
 
-// Health
+// Health + quick debug
 app.get("/", (_req, res) => res.send("OK"));
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
+app.get("/_debug/ping", (_req, res) => res.json({ ok: true, t: Date.now() }));
 
-// Inbox → επιστρέφει expanded messages
+// Inbox → expanded messages
 app.get("/messages/:mailbox", async (req, res) => {
   try {
     const key = mailboxKey(req.params.mailbox);
@@ -65,7 +66,7 @@ app.get("/messages/:mailbox", async (req, res) => {
   }
 });
 
-// Read single message
+// Single message
 app.get("/message/:id", async (req, res) => {
   try {
     const val = await redis.get(messageKey(req.params.id));
@@ -77,7 +78,7 @@ app.get("/message/:id", async (req, res) => {
   }
 });
 
-// Delete inbox
+// Delete mailbox
 app.delete("/messages/:mailbox", async (req, res) => {
   try {
     const key = mailboxKey(req.params.mailbox);
@@ -91,8 +92,9 @@ app.delete("/messages/:mailbox", async (req, res) => {
   }
 });
 
-// Test endpoints (ΜΟΝΟ αν DEV_MODE=1)
+// Test endpoints (DEV only)
 if (DEV_MODE) {
+  // GET — απαντάει ακαριαία, γράφει με pipeline
   app.get("/_test/push", async (req, res) => {
     try {
       const to = (req.query.to || "test@example.com").toLowerCase();
@@ -105,14 +107,26 @@ if (DEV_MODE) {
         html: "",
         date: new Date().toISOString()
       };
-      await storeMessage(to, record);
-      res.json({ ok: true, stored: record });
+
+      // άμεση απάντηση στον client
+      res.json({ ok: true, accepted: true, id: record.id, to });
+
+      // write στο background (χωρίς να κρατήσουμε open το request)
+      const mKey = messageKey(record.id);
+      const listKey = mailboxKey(to);
+      const pipe = redis.pipeline();
+      pipe.set(mKey, JSON.stringify(record), "EX", MSG_TTL);
+      pipe.lpush(listKey, record.id);
+      pipe.ltrim(listKey, 0, 199);
+      pipe.expire(listKey, INBOX_TTL);
+      pipe.exec().catch((e) => console.warn("[test] pipeline error:", e?.message || e));
     } catch (e) {
       console.error("[test] push error:", e);
-      res.status(500).json({ error: "push failed" });
+      if (!res.headersSent) res.status(500).json({ ok: false, error: "push failed" });
     }
   });
 
+  // POST
   app.post("/_test/push", async (req, res) => {
     try {
       const to = (req.body.to || "test@example.com").toLowerCase();
@@ -125,11 +139,11 @@ if (DEV_MODE) {
         html: req.body.html || "",
         date: new Date().toISOString()
       };
-    await storeMessage(to, record);
+      await storeMessage(to, record);
       res.json({ ok: true, stored: record });
     } catch (e) {
       console.error("[test] push error:", e);
-      res.status(500).json({ error: "push failed" });
+      res.status(500).json({ ok: false, error: "push failed" });
     }
   });
 }
@@ -139,8 +153,7 @@ const httpServer = app.listen(WEB_PORT, () => {
 });
 
 /* ============== SMTP server (internal testing) ==========
-   Render δεν proxy-άρει 25· το 2525 είναι μόνο για internal/integration tests.
-   Για public inbound προτίμησε provider με webhooks (Mailgun/Postmark/Resend). */
+   Για public inbound προτίμησε provider με webhooks (Mailgun/Resend/Postmark). */
 const smtp = new SMTPServer({
   disabledCommands: ["AUTH"],
   logger: false,

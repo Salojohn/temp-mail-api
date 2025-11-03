@@ -1,4 +1,3 @@
-// server.js
 import express from "express";
 import bodyParser from "body-parser";
 import cors from "cors";
@@ -10,14 +9,14 @@ import { redis } from "./redisClient.js";
 
 /* ------------ ENV ------------ */
 const WEB_PORT   = process.env.PORT || 3000;
-const SMTP_PORT  = process.env.SMTP_PORT || 2525;    // Render δεν εκθέτει :25
+const SMTP_PORT  = process.env.SMTP_PORT || 2525;      // Render δεν εκθέτει 25 δημοσίως
 const DEV_MODE   = process.env.DEV_MODE === "1";
 const INBOX_TTL  = Number(process.env.INBOX_TTL || 600); // sec
 const MSG_TTL    = Number(process.env.MSG_TTL   || 600); // sec
 const DOMAIN     = (process.env.DOMAIN || "temp-mail.gr").toLowerCase();
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*";
 
-/* ------------ Express app ------------ */
+/* ------------ Express ------------ */
 const app = express();
 app.disable("x-powered-by");
 app.set("trust proxy", 1); // πίσω από Render proxy
@@ -26,17 +25,15 @@ app.use(helmet());
 app.use(cors({ origin: FRONTEND_ORIGIN }));
 app.use(bodyParser.json({ limit: "1mb" }));
 
-app.use(
-  rateLimit({
-    windowMs: 60 * 1000,
-    limit: 120,
-    standardHeaders: true,
-    legacyHeaders: false,
-    keyGenerator: (req) => req.ip,
-  })
-);
+app.use(rateLimit({
+  windowMs: 60 * 1000,
+  limit: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.ip
+}));
 
-/* ------------ helpers ------------ */
+/* ------------ Helpers ------------ */
 const randomId = (len = 10) =>
   Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2, 2 + len);
 
@@ -49,22 +46,18 @@ const isValidEmail = (email = "") =>
 const mailboxKey = (addr) => `mailbox:${addr.toLowerCase()}`;
 const messageKey = (id)   => `msg:${id}`;
 
-// helper: time-guard (μην “κρεμάει” ποτέ ο client)
 const withTimeout = (p, ms = 1500) =>
-  Promise.race([
-    p,
-    new Promise((_, rej) => setTimeout(() => rej(new Error("TIMEOUT")), ms)),
-  ]);
+  Promise.race([ p, new Promise((_, rej) => setTimeout(() => rej(new Error("TIMEOUT")), ms)) ]);
 
-/** Αποθήκευση μηνύματος σε Redis (pipeline) */
-async function storeMessage(record) {
-  const listKey = mailboxKey(record.to);
-  const mKey    = messageKey(record.id);
+/** Αποθήκευση μηνύματος σε Redis (pipeline + TTLs) */
+async function storeMessage(rec) {
+  const listKey = mailboxKey(rec.to);
+  const mKey    = messageKey(rec.id);
   const pipe = redis.pipeline();
-  pipe.lpush(listKey, JSON.stringify(record));
-  pipe.ltrim(listKey, 0, 199);                 // κρατάμε έως 200
+  pipe.lpush(listKey, JSON.stringify(rec));
+  pipe.ltrim(listKey, 0, 199);                 // έως 200 ανά inbox
   pipe.expire(listKey, INBOX_TTL);
-  pipe.set(mKey, JSON.stringify(record), "EX", MSG_TTL);
+  pipe.set(mKey, JSON.stringify(rec), "EX", MSG_TTL);
   await pipe.exec();
 }
 
@@ -75,21 +68,18 @@ function generateAddress() {
 }
 
 /* ------------ Routes ------------ */
-// Health + debug
+// Health/debug
 app.get("/", (_req, res) => res.send("OK"));
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 app.get("/_debug/ping", (_req, res) =>
   res.json({ ok: true, t: Date.now(), dev: DEV_MODE, domain: DOMAIN })
 );
 
-// Δημιουργία temp email
+// Δημιουργία temp email (για frontend)
 app.post("/create", async (_req, res) => {
   const address = generateAddress();
   const key = mailboxKey(address);
-  try {
-    // προ-δημιούργησε inbox με TTL ώστε να ξέρει ο client το lifetime
-    await redis.expire(key, INBOX_TTL);
-  } catch { /* ignore */ }
+  try { await redis.expire(key, INBOX_TTL); } catch {}
   res.json({ ok: true, address, ttl: INBOX_TTL, domain: DOMAIN });
 });
 
@@ -102,7 +92,7 @@ app.get("/messages/:mailbox", async (req, res) => {
     }
     const key  = mailboxKey(addr);
 
-    let raw = [];
+    let raw;
     try {
       raw = await withTimeout(redis.lrange(key, 0, 49), 1500);
     } catch (e) {
@@ -115,9 +105,8 @@ app.get("/messages/:mailbox", async (req, res) => {
 
     if (!raw?.length) return res.json({ mailbox: addr, count: 0, items: [] });
 
-    const items = raw.map((s) => {
-      try { return JSON.parse(s); } catch { return null; }
-    }).filter(Boolean);
+    const items = raw.map((s) => { try { return JSON.parse(s); } catch { return null; } })
+                     .filter(Boolean);
 
     res.json({ mailbox: addr, count: items.length, items });
   } catch (err) {
@@ -126,33 +115,29 @@ app.get("/messages/:mailbox", async (req, res) => {
   }
 });
 
-// Λήψη ενός μηνύματος
+// Λήψη single message
 app.get("/message/:id", async (req, res) => {
   try {
     const val = await withTimeout(redis.get(messageKey(req.params.id)), 1500);
     if (!val) return res.status(404).json({ error: "Not found" });
     res.json(JSON.parse(val));
   } catch (e) {
-    if (e.message === "TIMEOUT") {
-      return res.status(504).json({ error: "Timeout" });
-    }
+    if (e.message === "TIMEOUT") return res.status(504).json({ error: "Timeout" });
     console.error("[/message] error:", e);
     res.status(500).json({ error: "Failed to fetch" });
   }
 });
 
-// Διαγραφή inbox
+// Διαγραφή inbox (προαιρετικό)
 app.delete("/messages/:mailbox", async (req, res) => {
   try {
     const addr = normalizeEmail(req.params.mailbox);
-    if (!isValidEmail(addr)) {
-      return res.status(400).json({ error: "invalid mailbox" });
-    }
+    if (!isValidEmail(addr)) return res.status(400).json({ error: "invalid mailbox" });
+
     const key = mailboxKey(addr);
-    const idsRaw = await withTimeout(redis.lrange(key, 0, -1), 1500).catch(() => []);
-    if (idsRaw?.length) {
-      // σβήσε και τα per-message keys
-      const parsed = idsRaw.map((s) => { try { return JSON.parse(s); } catch { return null; } }).filter(Boolean);
+    const raw = await withTimeout(redis.lrange(key, 0, -1), 1500).catch(() => []);
+    if (raw?.length) {
+      const parsed = raw.map((s) => { try { return JSON.parse(s); } catch { return null; } }).filter(Boolean);
       const ids = parsed.map((r) => r.id).filter(Boolean);
       if (ids.length) await redis.del(...ids.map(messageKey)).catch(() => {});
     }
@@ -164,31 +149,20 @@ app.delete("/messages/:mailbox", async (req, res) => {
   }
 });
 
-/* ------------ DEV test (εικονική εισαγωγή) ------------ */
+/* ------------ DEV test routes ------------ */
 if (DEV_MODE) {
-  // GET: /_test/push?to=a@b.com&subject=Hi&text=Hello
+  // GET async (απαντάει άμεσα, γράφει στο background)
   app.get("/_test/push", async (req, res) => {
     try {
       const to      = normalizeEmail(req.query.to);
       const subject = String(req.query.subject || "");
       const text    = String(req.query.text || "");
-      if (!isValidEmail(to)) {
-        return res.status(400).json({ ok: false, error: "Invalid 'to' address" });
-      }
+      if (!isValidEmail(to)) return res.status(400).json({ ok: false, error: "Invalid 'to' address" });
 
       const id = randomId(8);
-      const rec = {
-        id,
-        to,
-        from: `tester@${DOMAIN}`,
-        subject,
-        text,
-        html: "",
-        date: new Date().toISOString(),
-        headers: { "x-dev": "true" }
-      };
+      const rec = { id, to, from: `tester@${DOMAIN}`, subject, text, html: "", date: new Date().toISOString(), headers: { "x-dev": "true" } };
 
-      // απάντησε ΑΜΕΣΑ
+      // απάντησε αμέσως
       res.json({ ok: true, accepted: true, id, to });
 
       // γράψε στο παρασκήνιο
@@ -204,23 +178,16 @@ if (DEV_MODE) {
     }
   });
 
-  // POST: /_test/push  { to, subject, text }
+  // POST sync (περιμένει να γραφτεί)
   app.post("/_test/push", async (req, res) => {
     try {
       const to      = normalizeEmail(req.body?.to);
       const subject = String(req.body?.subject || "");
       const text    = String(req.body?.text || "");
-      if (!isValidEmail(to)) {
-        return res.status(400).json({ ok: false, error: "Invalid 'to' address" });
-      }
+      if (!isValidEmail(to)) return res.status(400).json({ ok: false, error: "Invalid 'to' address" });
+
       const id = randomId(8);
-      const rec = {
-        id, to,
-        from: `tester@${DOMAIN}`,
-        subject, text, html: "",
-        date: new Date().toISOString(),
-        headers: { "x-dev": "true" }
-      };
+      const rec = { id, to, from: `tester@${DOMAIN}`, subject, text, html: "", date: new Date().toISOString(), headers: { "x-dev": "true" } };
       await storeMessage(rec);
       res.json({ ok: true, stored: rec });
     } catch (e) {
@@ -228,9 +195,27 @@ if (DEV_MODE) {
       res.status(500).json({ ok: false, error: "push failed" });
     }
   });
+
+  // GET sync (νέο — για δοκιμή από browser)
+  app.get("/_test/push_sync", async (req, res) => {
+    try {
+      const to      = normalizeEmail(req.query.to);
+      const subject = String(req.query.subject || "");
+      const text    = String(req.query.text || "");
+      if (!isValidEmail(to)) return res.status(400).json({ ok: false, error: "Invalid 'to' address" });
+
+      const id = randomId(8);
+      const rec = { id, to, from: `tester@${DOMAIN}`, subject, text, html: "", date: new Date().toISOString(), headers: { "x-dev": "true" } };
+      await storeMessage(rec); // synch write
+      res.json({ ok: true, stored: true, id, to });
+    } catch (e) {
+      console.error("[_test/push_sync] error:", e);
+      res.status(500).json({ ok: false, error: "push_sync failed" });
+    }
+  });
 }
 
-/* ------------ SMTP server (internal use) ------------ */
+/* ------------ SMTP (internal) ------------ */
 const smtp = new SMTPServer({
   disabledCommands: ["AUTH"], // demo only
   logger: false,

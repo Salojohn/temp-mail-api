@@ -38,7 +38,7 @@ redis.on("error", (e) => {
   }
 });
 
-// keep-alive (free plans)
+// keep-alive για free plans
 setInterval(() => {
   redis.ping().catch(() => {});
 }, 20000);

@@ -16,28 +16,24 @@ if (!redisUrl || !redisToken) {
   console.error("[redis] Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN");
 }
 
-const redis = new UpstashRedis({
-  url: redisUrl,
-  token: redisToken,
-});
+const redis = new UpstashRedis({ url: redisUrl, token: redisToken });
 
-async function rGet(key)        { return await redis.get(key); }
-async function rSetEX(key,v,ex) { return await redis.set(key, v, { ex }); }
-async function rLPush(key,v)    { return await redis.lpush(key, v); }
-async function rLTrim(key,s,e)  { return await redis.ltrim(key, s, e); }
-async function rLRange(key,s,e) { return await redis.lrange(key, s, e); }
-async function rExpire(key,sec) { return await redis.expire(key, sec); }
-async function rDel(key)        { return await redis.del(key); }
+const rGet        = async (k)        => await redis.get(k);
+const rSetEX      = async (k,v,ex)   => await redis.set(k, v, { ex });
+const rLPush      = async (k,v)      => await redis.lpush(k, v);
+const rLTrim      = async (k,s,e)    => await redis.ltrim(k, s, e);
+const rLRange     = async (k,s,e)    => await redis.lrange(k, s, e);
+const rExpire     = async (k,sec)    => await redis.expire(k, sec);
+const rDel        = async (k)        => await redis.del(k);
 
 /* -------------------- App -------------------- */
 const app = express();
 const WEB_PORT = process.env.PORT || 3000;
 
-// IMPORTANT για proxies (Render) και express-rate-limit:
-app.set("trust proxy", 1);
+app.set("trust proxy", 1);       // Απαραίτητο για Render & rate-limit
 app.disable("x-powered-by");
 
-/* --- Health routes ΠΡΙΝ το rate-limit --- */
+/* --- Health/debug ΠΡΙΝ το rate-limit --- */
 app.get("/", (_req, res) => res.json({ ok: true }));
 app.get("/healthz", (_req, res) => res.status(200).send("OK"));
 app.get("/_debug/ping", (_req, res) =>
@@ -50,14 +46,30 @@ app.get("/_debug/ping", (_req, res) =>
   })
 );
 app.get("/_debug/redis", (_req, res) =>
-  res.json({
-    ok: true,
-    hasUrl: !!redisUrl,
-    hasToken: !!redisToken,
-  })
+  res.json({ ok: true, hasUrl: !!redisUrl, hasToken: !!redisToken })
 );
 
-/* --- Common middlewares --- */
+/* --- NEW: Self-test για Upstash --- */
+app.get("/_debug/selftest", async (_req, res) => {
+  try {
+    const key = `selftest:${Date.now()}`;
+    // 1) SETEX
+    await rSetEX(key, JSON.stringify({ ok: true }), 30);
+    // 2) GET
+    const got = await rGet(key);
+    // 3) LIST ops
+    const lkey = `selflist:${Date.now()}`;
+    await rLPush(lkey, "a");
+    await rLPush(lkey, "b");
+    await rExpire(lkey, 30);
+    const lr = await rLRange(lkey, 0, 9);
+    res.json({ ok: true, setexValue: got, list: lr });
+  } catch (e) {
+    console.error("[selftest] error:", e);
+    res.status(500).json({ ok: false, error: e.message, stack: String(e.stack || "") });
+  }
+});
+
 app.use(helmet());
 app.use(cors({
   origin: (origin, cb) => {
@@ -69,12 +81,12 @@ app.use(cors({
 }));
 app.use(bodyParser.json({ limit: "1mb" }));
 
-/* --- Rate limit ΜΕ skip για health/debug --- */
 app.use(rateLimit({
   windowMs: 60 * 1000,
   limit: 120,
   standardHeaders: true,
   legacyHeaders: false,
+  // Μην φρενάρεις health/debug, για να μην παίρνουμε 500 από το lib
   skip: (req) => req.path === "/" || req.path === "/healthz" || req.path.startsWith("/_debug")
 }));
 
@@ -91,17 +103,22 @@ const messageKey = (id) => `msg:${id}`;
 
 // POST /create -> { ok, email, local, expires_in }
 async function handleCreate(_req, res) {
-  try {
-    const local = Math.random().toString(36).slice(2, 10);
-    const email = `${local}@${DOMAIN}`;
-    const key = mailboxKeyFromLocal(local);
+  const local = Math.random().toString(36).slice(2, 10);
+  const email = `${local}@${DOMAIN}`;
+  const key = mailboxKeyFromLocal(local);
 
-    await rDel(key);
-    await rExpire(key, INBOX_TTL); // δημιουργούμε TTL (λίστα θα γεμίσει με ids)
+  try {
+    // 1) Καθάρισε/ετοίμασε inbox
+    await rDel(key);                           // ok αν δεν υπάρχει
+    // 2) Βάλε ένα marker για να υπάρχει key (ώστε να μην κολλήσει EXPIRE)
+    await rLPush(key, "__init__");             // δημιουργεί τη λίστα
+    await rLTrim(key, 1, -1);                  // σβήσε το marker, λίστα άδεια
+    // 3) TTL
+    await rExpire(key, INBOX_TTL);             // λίστα με TTL, ακόμα κι αν είναι άδεια
 
     return res.json({ ok: true, email, local, expires_in: INBOX_TTL });
   } catch (e) {
-    console.error("create error:", e);
+    console.error("[create] error:", e);
     return res.status(500).json({ ok: false, error: e.message || "create_failed" });
   }
 }
@@ -117,6 +134,7 @@ async function handleInbox(req, res) {
     const messages = [];
 
     for (const id of ids) {
+      if (id === "__init__") continue;  // αγνόησε τυχόν marker
       const raw = await rGet(messageKey(id));
       if (!raw) continue;
       const m = typeof raw === "string" ? JSON.parse(raw) : raw;
@@ -193,13 +211,14 @@ if (process.env.DEV_MODE) {
       const local = toAddress.split("@")[0];
 
       await rSetEX(messageKey(id), JSON.stringify(msg), MSG_TTL);
-      await rLPush(mailboxKeyFromLocal(local), id);
-      await rLTrim(mailboxKeyFromLocal(local), 0, 199);
-      await rExpire(mailboxKeyFromLocal(local), INBOX_TTL);
+      const mbox = mailboxKeyFromLocal(local);
+      await rLPush(mbox, id);
+      await rLTrim(mbox, 0, 199);
+      await rExpire(mbox, INBOX_TTL);
 
       return res.json({ ok: true, accepted: true, id, to: toAddress });
     } catch (e) {
-      console.error(e);
+      console.error("[_test/push] error:", e);
       return res.status(500).json({ ok: false, error: e.message || "push_failed" });
     }
   });
@@ -231,9 +250,10 @@ const smtp = new SMTPServer({
           const local = to.split("@")[0];
 
           await rSetEX(messageKey(id), JSON.stringify(msg), MSG_TTL);
-          await rLPush(mailboxKeyFromLocal(local), id);
-          await rLTrim(mailboxKeyFromLocal(local), 0, 199);
-          await rExpire(mailboxKeyFromLocal(local), INBOX_TTL);
+          const mbox = mailboxKeyFromLocal(local);
+          await rLPush(mbox, id);
+          await rLTrim(mbox, 0, 199);
+          await rExpire(mbox, INBOX_TTL);
 
           console.log(`[smtp] stored message for ${to}`);
           callback();

@@ -10,12 +10,13 @@ export const redis = new Redis(redisUrl, {
   reconnectOnError: (err) =>
     /READONLY|ECONNRESET|EPIPE|Connection is closed/i.test(err?.message || ""),
   enableReadyCheck: false,
-  keepAlive: 10000,
-  connectTimeout: 10000
+  keepAlive: 10_000,
+  connectTimeout: 10_000,
 });
 
 let firstConnect = true;
 let lastWarn = 0;
+
 redis.on("connect", () => {
   if (firstConnect) {
     console.log("[redis] connected");
@@ -24,7 +25,7 @@ redis.on("connect", () => {
 });
 redis.on("reconnecting", (ms) => {
   const now = Date.now();
-  if (now - lastWarn > 60000) {
+  if (now - lastWarn > 60_000) {
     console.warn(`[redis] reconnecting in ${ms}ms`);
     lastWarn = now;
   }
@@ -32,7 +33,7 @@ redis.on("reconnecting", (ms) => {
 redis.on("end", () => console.warn("[redis] connection closed"));
 redis.on("error", (e) => {
   const now = Date.now();
-  if (now - lastWarn > 60000) {
+  if (now - lastWarn > 60_000) {
     console.warn("[redis] transient issue:", e.code || e.message);
     lastWarn = now;
   }
@@ -41,7 +42,7 @@ redis.on("error", (e) => {
 // keep-alive για free plans
 setInterval(() => {
   redis.ping().catch(() => {});
-}, 20000);
+}, 20_000);
 
 // soft-guards
 process.on("unhandledRejection", (e) =>

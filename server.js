@@ -11,8 +11,8 @@ import { redis } from "./redisClient.js";
 const WEB_PORT   = process.env.PORT || 3000;
 const SMTP_PORT  = process.env.SMTP_PORT || 2525;
 const DEV_MODE   = process.env.DEV_MODE === "1";
-const INBOX_TTL  = Number(process.env.INBOX_TTL || 600); // sec
-const MSG_TTL    = Number(process.env.MSG_TTL   || 600); // sec
+const INBOX_TTL  = Number(process.env.INBOX_TTL || 600);
+const MSG_TTL    = Number(process.env.MSG_TTL   || 600);
 const DOMAIN     = (process.env.DOMAIN || "temp-mail.gr").toLowerCase();
 
 /* ------------ CORS allowlist ------------ */
@@ -20,32 +20,26 @@ const ALLOW_ORIGINS = new Set([
   "https://temp-mail.gr",
   "https://www.temp-mail.gr",
   "https://api.temp-mail.gr",
-  "https://temp-mail-api-2.onrender.com", // για self-calls / health
+  "https://temp-mail-api-2.onrender.com"
 ]);
 
-/* ------------ Express ------------ */
+/* ------------ App ------------ */
 const app = express();
 app.disable("x-powered-by");
 app.set("trust proxy", 1);
-
 app.use(helmet({ contentSecurityPolicy: false }));
-
 app.use(cors({
   origin(origin, cb) {
-    if (!origin) return cb(null, true); // curl/server-to-server
+    if (!origin) return cb(null, true);
     if (ALLOW_ORIGINS.has(origin)) return cb(null, true);
     return cb(new Error("CORS: origin not allowed"));
   }
 }));
 app.options("*", cors());
-
 app.use(bodyParser.json({ limit: "1mb" }));
-
 app.use(rateLimit({
-  windowMs: 60 * 1000,
-  limit: 120,
-  standardHeaders: true,
-  legacyHeaders: false,
+  windowMs: 60 * 1000, limit: 120,
+  standardHeaders: true, legacyHeaders: false,
   keyGenerator: (req) => req.ip
 }));
 
@@ -55,7 +49,6 @@ const randomId = (len = 10) =>
 
 const normalizeEmail = (s = "") => decodeURIComponent(String(s).trim().toLowerCase());
 const isValidEmail = (email = "") => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-
 const mailboxKey = (addr) => `mailbox:${addr.toLowerCase()}`;
 const messageKey = (id)   => `msg:${id}`;
 
@@ -78,16 +71,11 @@ function generateAddress(){
   return { local, email: `${local}@${DOMAIN}` };
 }
 
-/* ------------ Handlers (reuse για / και /api) ------------ */
+/* ------------ Handlers ------------ */
 async function handleCreate(_req, res){
   const { local, email } = generateAddress();
   try { await redis.expire(mailboxKey(email), INBOX_TTL); } catch {}
-  res.json({
-    ok: true,
-    email, local, expires_in: INBOX_TTL, domain: DOMAIN,
-    // legacy keys (αν τυχόν τα χρειαστείς)
-    address: email, ttl: INBOX_TTL
-  });
+  res.json({ ok: true, email, local, expires_in: INBOX_TTL, domain: DOMAIN });
 }
 
 async function handleInboxEmail(req, res){
@@ -95,13 +83,10 @@ async function handleInboxEmail(req, res){
     const addr = normalizeEmail(req.params.mailbox);
     if (!isValidEmail(addr)) return res.status(400).json({ error: "invalid mailbox" });
     const key = mailboxKey(addr);
-
     let raw;
     try { raw = await withTimeout(redis.lrange(key, 0, 49), 1500); }
     catch(e){ if (e.message === "TIMEOUT") return res.json({ mailbox: addr, count: 0, items: [] }); throw e; }
-
     if (!raw?.length) return res.json({ mailbox: addr, count: 0, items: [] });
-
     const items = raw.map(s => { try { return JSON.parse(s); } catch { return null; } }).filter(Boolean);
     res.json({ mailbox: addr, count: items.length, items });
   } catch (err) {
@@ -138,7 +123,6 @@ async function handleDeleteInboxEmail(req, res){
   try {
     const addr = normalizeEmail(req.params.mailbox);
     if (!isValidEmail(addr)) return res.status(400).json({ error: "invalid mailbox" });
-
     const key = mailboxKey(addr);
     const raw = await withTimeout(redis.lrange(key, 0, -1), 1500).catch(() => []);
     if (raw?.length){
@@ -167,45 +151,22 @@ async function handleDeleteInboxLocal(req, res){
 }
 
 /* ------------ Routes ------------ */
-// Health
 app.get("/", (_req, res) => res.send("OK"));
 app.get("/healthz", (_req, res) => res.json({ ok: true, time: Date.now() }));
 
-// Legacy (συμβατότητα)
+// Legacy (κρατάς για συμβατότητα)
 app.post("/create", handleCreate);
 app.get("/messages/:mailbox", handleInboxEmail);
 app.get("/message/:id", handleMessage);
 app.delete("/messages/:mailbox", handleDeleteInboxEmail);
 
-// Namespaced /api (frontend-friendly)
+// Namespaced /api (frontend)
 app.post("/api/create", handleCreate);
 app.get("/api/inbox/:local", handleInboxLocal);
 app.get("/api/message/:id", handleMessage);
 app.delete("/api/inbox/:local", handleDeleteInboxLocal);
 
-/* ------------ DEV test routes ------------ */
-if (DEV_MODE){
-  app.get("/_test/push", async (req, res) => {
-    try {
-      const to = normalizeEmail(req.query.to);
-      if (!isValidEmail(to)) return res.status(400).json({ ok: false, error: "Invalid 'to' address" });
-      const id = randomId(8);
-      const rec = { id, to, from:`tester@${DOMAIN}`, subject:String(req.query.subject||""), text:String(req.query.text||""), html:"", date:new Date().toISOString(), headers:{ "x-dev":"true" } };
-      res.json({ ok:true, accepted:true, id, to });
-      const pipe = redis.pipeline();
-      pipe.lpush(mailboxKey(to), JSON.stringify(rec));
-      pipe.ltrim(mailboxKey(to), 0, 199);
-      pipe.expire(mailboxKey(to), INBOX_TTL);
-      pipe.set(messageKey(id), JSON.stringify(rec), "EX", MSG_TTL);
-      pipe.exec().catch(e=>console.warn("[_test/push] pipeline error:", e?.message||e));
-    } catch (err) {
-      console.error("[_test/push] error:", err);
-      if (!res.headersSent) res.status(500).json({ ok:false, error:"push failed" });
-    }
-  });
-}
-
-/* ------------ SMTP (internal) ------------ */
+/* ------------ SMTP receiver ------------ */
 const smtp = new SMTPServer({
   disabledCommands: ["AUTH"],
   logger: false,
@@ -229,20 +190,12 @@ const smtp = new SMTPServer({
           await storeMessage(rec);
           console.log(`[smtp] stored message for ${toAddr}`);
           callback();
-        } catch (e) {
-          console.error("[smtp] store error:", e);
-          callback(e);
-        }
+        } catch (e) { console.error("[smtp] store error:", e); callback(e); }
       })
       .catch((err) => { console.error("[smtp] parse error:", err); callback(err); });
   }
 });
-
-smtp.listen(SMTP_PORT, "0.0.0.0", () => {
-  console.log(`[smtp] listening on :${SMTP_PORT}`);
-});
+smtp.listen(SMTP_PORT, "0.0.0.0", () => console.log(`[smtp] listening on :${SMTP_PORT}`));
 
 /* ------------ Start HTTP ------------ */
-app.listen(WEB_PORT, () => {
-  console.log(`[http] listening on :${WEB_PORT}`);
-});
+app.listen(WEB_PORT, () => console.log(`[http] listening on :${WEB_PORT}`));

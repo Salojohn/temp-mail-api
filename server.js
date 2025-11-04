@@ -21,19 +21,41 @@ redis.on("error",     e  => console.log("[redis] transient issue:", e.code || e.
 const app = express();
 const WEB_PORT = process.env.PORT || 3000;
 
-app.set("trust proxy", true);       // Render/Proxy safe
+app.set("trust proxy", true);
 app.disable("x-powered-by");
 
+// ---- CORS ----
+// Δήλωσε εδώ το/τα domain σου. Για δοκιμές μπορεί να μείνει '*'.
+// Ιδανικά: FRONTEND_ORIGIN="https://temp-mail.gr,https://www.temp-mail.gr"
+const originsEnv = (process.env.FRONTEND_ORIGIN || "*")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+const corsOptions = {
+  origin: originsEnv.length === 1 && originsEnv[0] === "*" ? "*" : originsEnv,
+  methods: ["GET","POST","OPTIONS"],
+  allowedHeaders: ["Content-Type","Authorization"],
+  credentials: false,
+};
+app.use(cors(corsOptions));
+// ρητή απάντηση στο preflight
+app.options("*", cors(corsOptions));
+
 app.use(helmet());
-app.use(cors({
-  origin: process.env.FRONTEND_ORIGIN || "*",
-}));
 app.use(bodyParser.json({ limit: "1mb" }));
+
+// ---- Rate limit (skip preflight & health) ----
 app.use(rateLimit({
   windowMs: 60 * 1000,
   limit: 120,
   standardHeaders: true,
-  legacyHeaders: false
+  legacyHeaders: false,
+  skip: (req) =>
+    req.method === "OPTIONS" ||
+    req.path === "/" ||
+    req.path === "/healthz" ||
+    req.path === "/_debug/ping"
 }));
 
 /* -------------------- Helpers -------------------- */
@@ -43,7 +65,6 @@ const MSG_TTL   = Number(process.env.MSG_TTL   || 600);
 const nowISO = () => new Date().toISOString();
 
 function mailboxKeyFromLocal(local) {
-  // local = "abc123" -> key: "inbox:abc123"
   return `inbox:${local}`;
 }
 function messageKey(id) {
@@ -60,16 +81,14 @@ app.get("/_debug/ping", (_req, res) => {
 /* -------------------- Core API logic -------------------- */
 
 // POST /create -> { email, local, expires_in }
-async function handleCreate(_req, res) {
+async function handleCreate(req, res) {
   try {
-    // Φτιάχνουμε local part τύπου abcdef (τυχαίο)
+    console.log("[create] from", req.ip);
     const local = Math.random().toString(36).slice(2, 10);
     const domain = process.env.DOMAIN || "temp-mail.gr";
     const email = `${local}@${domain}`;
 
     const key = mailboxKeyFromLocal(local);
-    // Δημιουργούμε το inbox ως κενή λίστα + TTL
-    // θα αποθηκεύουμε ΜΟΝΟ ids μηνυμάτων μέσα στη λίστα
     await redis.del(key);
     await redis.expire(key, INBOX_TTL);
 
@@ -145,7 +164,6 @@ app.get("/api/inbox/:local", handleInbox);
 app.get("/api/message/:id", handleMessage);
 
 /* -------------------- DEV: push fake messages -------------------- */
-/* Για γρήγορα tests χωρίς SMTP */
 if (process.env.DEV_MODE) {
   app.get("/_test/push", async (req, res) => {
     try {
@@ -167,7 +185,6 @@ if (process.env.DEV_MODE) {
         received_at: nowISO(),
       };
 
-      // local = part πριν το @
       const local = toAddress.split("@")[0];
       await redis.set(messageKey(id), JSON.stringify(msg), "EX", MSG_TTL);
       await redis.lpush(mailboxKeyFromLocal(local), id);
@@ -182,8 +199,7 @@ if (process.env.DEV_MODE) {
   });
 }
 
-/* -------------------- SMTP (προαιρετικό) -------------------- */
-/* Αν θες incoming SMTP για δοκιμές μέσα στο Render container (internal only) */
+/* -------------------- SMTP (optional) -------------------- */
 const SMTP_PORT = process.env.SMTP_PORT || 2525;
 const smtp = new SMTPServer({
   disabledCommands: ["AUTH"],
@@ -197,12 +213,8 @@ const smtp = new SMTPServer({
 
           const id  = Math.random().toString(36).slice(2);
           const msg = {
-            id,
-            from: mail.from?.text || "",
-            to,
-            subject: mail.subject || "",
-            text: mail.text || "",
-            html: mail.html || "",
+            id, from: mail.from?.text || "", to,
+            subject: mail.subject || "", text: mail.text || "", html: mail.html || "",
             received_at: nowISO(),
             headers: Object.fromEntries(mail.headerLines?.map(h => [h.key, h.line]) || []),
           };

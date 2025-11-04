@@ -6,37 +6,76 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { SMTPServer } from "smtp-server";
 import { simpleParser } from "mailparser";
-import { Redis } from "@upstash/redis";
+import { Redis as UpstashRedis } from "@upstash/redis";
 
-/* -------------------- Redis (Upstash REST) -------------------- */
-const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+/* -------------------- Upstash Redis (REST) -------------------- */
+const redisUrl = process.env.UPSTASH_REDIS_REST_URL || "";
+const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN || "";
+
+if (!redisUrl || !redisToken) {
+  console.error("[redis] Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN");
+}
+
+const redis = new UpstashRedis({
+  url: redisUrl,
+  token: redisToken,
 });
+
+async function rGet(key)        { return await redis.get(key); }
+async function rSetEX(key,v,ex) { return await redis.set(key, v, { ex }); }
+async function rLPush(key,v)    { return await redis.lpush(key, v); }
+async function rLTrim(key,s,e)  { return await redis.ltrim(key, s, e); }
+async function rLRange(key,s,e) { return await redis.lrange(key, s, e); }
+async function rExpire(key,sec) { return await redis.expire(key, sec); }
+async function rDel(key)        { return await redis.del(key); }
 
 /* -------------------- App -------------------- */
 const app = express();
 const WEB_PORT = process.env.PORT || 3000;
 
-app.set("trust proxy", true);
+// IMPORTANT για proxies (Render) και express-rate-limit:
+app.set("trust proxy", 1);
 app.disable("x-powered-by");
 
+/* --- Health routes ΠΡΙΝ το rate-limit --- */
+app.get("/", (_req, res) => res.json({ ok: true }));
+app.get("/healthz", (_req, res) => res.status(200).send("OK"));
+app.get("/_debug/ping", (_req, res) =>
+  res.json({
+    ok: true,
+    t: Date.now(),
+    dev: !!process.env.DEV_MODE,
+    domain: process.env.DOMAIN || null,
+    allowedList: (process.env.FRONTEND_ORIGIN || "*").split(",").map(s => s.trim()),
+  })
+);
+app.get("/_debug/redis", (_req, res) =>
+  res.json({
+    ok: true,
+    hasUrl: !!redisUrl,
+    hasToken: !!redisToken,
+  })
+);
+
+/* --- Common middlewares --- */
 app.use(helmet());
 app.use(cors({
   origin: (origin, cb) => {
-    const allowed = (process.env.FRONTEND_ORIGIN || "*")
-      .split(",")
-      .map(s => s.trim());
-    if (!origin || allowed.includes("*") || allowed.includes(origin)) return cb(null, true);
-    return cb(new Error("Not allowed by CORS"));
+    const allow = (process.env.FRONTEND_ORIGIN || "*")
+      .split(",").map(s => s.trim());
+    if (!origin || allow.includes("*") || allow.includes(origin)) return cb(null, true);
+    return cb(new Error("CORS blocked for origin: " + origin));
   }
 }));
 app.use(bodyParser.json({ limit: "1mb" }));
+
+/* --- Rate limit ΜΕ skip για health/debug --- */
 app.use(rateLimit({
   windowMs: 60 * 1000,
   limit: 120,
   standardHeaders: true,
-  legacyHeaders: false
+  legacyHeaders: false,
+  skip: (req) => req.path === "/" || req.path === "/healthz" || req.path.startsWith("/_debug")
 }));
 
 /* -------------------- Helpers -------------------- */
@@ -48,45 +87,39 @@ const nowISO = () => new Date().toISOString();
 const mailboxKeyFromLocal = (local) => `inbox:${local}`;
 const messageKey = (id) => `msg:${id}`;
 
-/* -------------------- Debug/Health -------------------- */
-app.get("/", (_req, res) => res.json({ ok: true }));
-app.get("/healthz", (_req, res) => res.json({ ok: true }));
-app.get("/_debug/ping", (_req, res) => {
-  const allowedList = (process.env.FRONTEND_ORIGIN || "*").split(",").map(s => s.trim());
-  res.json({ ok: true, t: Date.now(), dev: !!process.env.DEV_MODE, domain: DOMAIN, allowedList });
-});
-
 /* -------------------- Core API -------------------- */
+
 // POST /create -> { ok, email, local, expires_in }
 async function handleCreate(_req, res) {
   try {
     const local = Math.random().toString(36).slice(2, 10);
     const email = `${local}@${DOMAIN}`;
-
     const key = mailboxKeyFromLocal(local);
-    // Δημιουργία/refresh inbox (κενή λίστα) και TTL
-    await redis.del(key);
-    await redis.expire(key, INBOX_TTL); // Upstash δέχεται expire χωρίς τιμή; χρησιμοποιούμε set+EX εναλλακτικά
 
-    res.json({ ok: true, email, local, expires_in: INBOX_TTL });
+    await rDel(key);
+    await rExpire(key, INBOX_TTL); // δημιουργούμε TTL (λίστα θα γεμίσει με ids)
+
+    return res.json({ ok: true, email, local, expires_in: INBOX_TTL });
   } catch (e) {
     console.error("create error:", e);
-    res.status(500).json({ ok: false, error: "create_failed", detail: String(e) });
+    return res.status(500).json({ ok: false, error: e.message || "create_failed" });
   }
 }
 
-// GET /inbox/:local -> { ok, messages:[...] }
+// GET /inbox/:local -> { ok, messages: [...] }
 async function handleInbox(req, res) {
   try {
     const local = req.params.local;
     if (!local) return res.status(400).json({ ok: false, error: "missing_local" });
 
     const key = mailboxKeyFromLocal(local);
-    const ids = await redis.lrange(key, 0, 49);
+    const ids = await rLRange(key, 0, 49);
     const messages = [];
+
     for (const id of ids) {
-      const m = await redis.get(messageKey(id));
-      if (!m) continue;
+      const raw = await rGet(messageKey(id));
+      if (!raw) continue;
+      const m = typeof raw === "string" ? JSON.parse(raw) : raw;
       messages.push({
         id: m.id,
         from: m.from || "",
@@ -95,10 +128,10 @@ async function handleInbox(req, res) {
         received_at: m.received_at || m.date || nowISO(),
       });
     }
-    res.json({ ok: true, messages });
+    return res.json({ ok: true, messages });
   } catch (e) {
     console.error("inbox error:", e);
-    res.status(500).json({ ok: false, error: "inbox_failed", detail: String(e) });
+    return res.status(500).json({ ok: false, error: e.message || "inbox_failed" });
   }
 }
 
@@ -108,10 +141,11 @@ async function handleMessage(req, res) {
     const id = req.params.id;
     if (!id) return res.status(400).json({ ok: false, error: "missing_id" });
 
-    const m = await redis.get(messageKey(id));
-    if (!m) return res.status(404).json({ ok: false, error: "not_found" });
+    const raw = await rGet(messageKey(id));
+    if (!raw) return res.status(404).json({ ok: false, error: "not_found" });
 
-    res.json({
+    const m = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return res.json({
       ok: true,
       id: m.id,
       from: m.from || "",
@@ -123,21 +157,20 @@ async function handleMessage(req, res) {
     });
   } catch (e) {
     console.error("message error:", e);
-    res.status(500).json({ ok: false, error: "message_failed", detail: String(e) });
+    return res.status(500).json({ ok: false, error: e.message || "message_failed" });
   }
 }
 
-/* ---- Routes χωρίς /api ---- */
+/* ---- Routes (και /api/* aliases) ---- */
 app.post("/create", handleCreate);
 app.get("/inbox/:local", handleInbox);
 app.get("/message/:id", handleMessage);
 
-/* ---- Aliases με /api/* ---- */
 app.post("/api/create", handleCreate);
 app.get("/api/inbox/:local", handleInbox);
 app.get("/api/message/:id", handleMessage);
 
-/* -------------------- DEV: push fake messages -------------------- */
+/* -------------------- DEV: /_test/push -------------------- */
 if (process.env.DEV_MODE) {
   app.get("/_test/push", async (req, res) => {
     try {
@@ -147,7 +180,6 @@ if (process.env.DEV_MODE) {
       if (!/^[^@]+@[^@]+\.[^@]+$/.test(toAddress)) {
         return res.status(400).json({ ok: false, error: "Invalid 'to' address" });
       }
-
       const id = Math.random().toString(36).slice(2);
       const msg = {
         id,
@@ -158,24 +190,22 @@ if (process.env.DEV_MODE) {
         html: `<p>${text}</p>`,
         received_at: nowISO(),
       };
-
       const local = toAddress.split("@")[0];
 
-      await redis.set(messageKey(id), msg, { ex: MSG_TTL });
-      await redis.lpush(mailboxKeyFromLocal(local), id);
-      await redis.ltrim(mailboxKeyFromLocal(local), 0, 199);
-      await redis.expire(mailboxKeyFromLocal(local), INBOX_TTL);
+      await rSetEX(messageKey(id), JSON.stringify(msg), MSG_TTL);
+      await rLPush(mailboxKeyFromLocal(local), id);
+      await rLTrim(mailboxKeyFromLocal(local), 0, 199);
+      await rExpire(mailboxKeyFromLocal(local), INBOX_TTL);
 
-      res.json({ ok: true, accepted: true, id, to: toAddress });
+      return res.json({ ok: true, accepted: true, id, to: toAddress });
     } catch (e) {
       console.error(e);
-      res.status(500).json({ ok: false, error: "push_failed", detail: String(e) });
+      return res.status(500).json({ ok: false, error: e.message || "push_failed" });
     }
   });
 }
 
-/* -------------------- (Προαιρετικό) SMTP -------------------- */
-// Το Render δεν εκθέτει SMTP προς τα έξω, το κρατάμε μόνο για εσωτερικό testing.
+/* -------------------- (Προαιρετικό) SMTP για internal tests -------------------- */
 const SMTP_PORT = process.env.SMTP_PORT || 2525;
 const smtp = new SMTPServer({
   disabledCommands: ["AUTH"],
@@ -198,12 +228,12 @@ const smtp = new SMTPServer({
             received_at: nowISO(),
             headers: Object.fromEntries(mail.headerLines?.map(h => [h.key, h.line]) || []),
           };
-
           const local = to.split("@")[0];
-          await redis.set(messageKey(id), msg, { ex: MSG_TTL });
-          await redis.lpush(mailboxKeyFromLocal(local), id);
-          await redis.ltrim(mailboxKeyFromLocal(local), 0, 199);
-          await redis.expire(mailboxKeyFromLocal(local), INBOX_TTL);
+
+          await rSetEX(messageKey(id), JSON.stringify(msg), MSG_TTL);
+          await rLPush(mailboxKeyFromLocal(local), id);
+          await rLTrim(mailboxKeyFromLocal(local), 0, 199);
+          await rExpire(mailboxKeyFromLocal(local), INBOX_TTL);
 
           console.log(`[smtp] stored message for ${to}`);
           callback();

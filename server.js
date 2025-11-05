@@ -278,4 +278,4 @@ smtp.listen(SMTP_PORT, "0.0.0.0", () => {
 /* -------------------- Start -------------------- */
 app.listen(WEB_PORT, () => {
   console.log(`[http] listening on :${WEB_PORT}`);
-});
+}); 

@@ -1,195 +1,278 @@
-import express from 'express';
-import cors from 'cors';
-import multer from 'multer';
-import { simpleParser } from 'mailparser';
-import { Redis } from '@upstash/redis';
-import { v4 as uuid } from 'uuid';
+// server.js
+import express from "express";
+import bodyParser from "body-parser";
+import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import { SMTPServer } from "smtp-server";
+import { simpleParser } from "mailparser";
+import { Redis as UpstashRedis } from "@upstash/redis";
 
+/* -------------------- Upstash Redis (REST) -------------------- */
+const redisUrl = process.env.UPSTASH_REDIS_REST_URL || "";
+const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN || "";
+
+if (!redisUrl || !redisToken) {
+  console.error("[redis] Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN");
+}
+
+const redis = new UpstashRedis({ url: redisUrl, token: redisToken });
+
+const rGet        = async (k)        => await redis.get(k);
+const rSetEX      = async (k,v,ex)   => await redis.set(k, v, { ex });
+const rLPush      = async (k,v)      => await redis.lpush(k, v);
+const rLTrim      = async (k,s,e)    => await redis.ltrim(k, s, e);
+const rLRange     = async (k,s,e)    => await redis.lrange(k, s, e);
+const rExpire     = async (k,sec)    => await redis.expire(k, sec);
+const rDel        = async (k)        => await redis.del(k);
+
+/* -------------------- App -------------------- */
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: '1mb' }));
+const WEB_PORT = process.env.PORT || 3000;
 
-// ---- ENV ----
-const {
-  UPSTASH_REDIS_REST_URL,
-  UPSTASH_REDIS_REST_TOKEN,
-  API_KEY = '',       // ίδιο με τον Worker
-  DOMAIN = 'temp-mail.gr',
-  INBOX_TTL = '600',  // sec
-  MSG_TTL = '600'     // sec
-} = process.env;
+app.set("trust proxy", 1);       // Απαραίτητο για Render & rate-limit
+app.disable("x-powered-by");
 
-const redis = new Redis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN });
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
+/* --- Health/debug ΠΡΙΝ το rate-limit --- */
+app.get("/", (_req, res) => res.json({ ok: true }));
+app.get("/healthz", (_req, res) => res.status(200).send("OK"));
+app.get("/_debug/ping", (_req, res) =>
+  res.json({
+    ok: true,
+    t: Date.now(),
+    dev: !!process.env.DEV_MODE,
+    domain: process.env.DOMAIN || null,
+    allowedList: (process.env.FRONTEND_ORIGIN || "*").split(",").map(s => s.trim()),
+  })
+);
+app.get("/_debug/redis", (_req, res) =>
+  res.json({ ok: true, hasUrl: !!redisUrl, hasToken: !!redisToken })
+);
 
-// ------------------------------
-// util helpers
-// ------------------------------
-const inboxKey = (local) => `inbox:${local}`;
-const msgKey   = (id)    => `msg:${id}`;
-const attKey   = (id)    => `att:${id}`;
-
-// ------------------------------
-// PUSH (από Worker) – δέχεται raw MIME
-// ------------------------------
-app.post('/push', upload.single('raw'), async (req, res) => {
+/* --- NEW: Self-test για Upstash --- */
+app.get("/_debug/selftest", async (_req, res) => {
   try {
-    if (!req.body?.api_key || req.body.api_key !== API_KEY) {
-      return res.status(401).json({ ok: false, error: 'unauthorized' });
-    }
-    if (!req.file?.buffer) {
-      return res.status(400).json({ ok: false, error: 'missing raw' });
-    }
-
-    const to = String(req.body.to || '').trim().toLowerCase();
-    const from = String(req.body.from || '').trim();
-    const subject = String(req.body.subject || '').trim();
-
-    // Περιμένουμε to = "<local>@temp-mail.gr"
-    const local = to.split('@')[0] || '';
-    if (!local) return res.status(400).json({ ok: false, error: 'bad to' });
-
-    // Parse MIME
-    const parsed = await simpleParser(req.file.buffer);
-
-    // Σώματα
-    const body_plain = parsed.text || '';
-    const body_html  = parsed.html ? (typeof parsed.html === 'string' ? parsed.html : parsed.html.toString()) : '';
-
-    // Preview
-    const preview = (parsed.text || '').slice(0, 160);
-
-    // Headers (flatten)
-    const headers = {};
-    for (const [k, v] of parsed.headers) headers[k] = v;
-
-    // Φτιάξε message object
-    const id = uuid().replace(/-/g, '').slice(0, 10);
-    const received_at = new Date().toISOString();
-
-    const msg = {
-      id,
-      local,
-      email: `${local}@${DOMAIN}`,
-      from: parsed.from?.text || from || '',
-      subject: parsed.subject || subject || '',
-      preview,
-      received_at,
-      headers,
-      body_plain,
-      body_html,
-      attachments: []
-    };
-
-    // Attachments: αποθηκεύουμε σε Redis ως base64 + meta
-    if (Array.isArray(parsed.attachments) && parsed.attachments.length) {
-      for (const a of parsed.attachments) {
-        const attId = uuid().replace(/-/g, '').slice(0, 12);
-        const meta = {
-          id: attId,
-          filename: a.filename || 'file',
-          contentType: a.contentType || 'application/octet-stream',
-          size: a.size || (a.content?.length || 0)
-        };
-        msg.attachments.push(meta);
-        // σώζουμε το περιεχόμενο ξεχωριστά (base64)
-        const b64 = a.content ? Buffer.from(a.content).toString('base64') : '';
-        await redis.set(attKey(attId), { b64, meta }, { ex: Number(MSG_TTL) });
-      }
-    }
-
-    // 1) σώζουμε το full message
-    await redis.set(msgKey(id), msg, { ex: Number(MSG_TTL) });
-
-    // 2) index στο inbox (λίστα με ids πιο πρόσφατα μπροστά)
-    await redis.lpush(inboxKey(local), id);
-    await redis.expire(inboxKey(local), Number(INBOX_TTL));
-
-    return res.json({ ok: true, id });
+    const key = `selftest:${Date.now()}`;
+    // 1) SETEX
+    await rSetEX(key, JSON.stringify({ ok: true }), 30);
+    // 2) GET
+    const got = await rGet(key);
+    // 3) LIST ops
+    const lkey = `selflist:${Date.now()}`;
+    await rLPush(lkey, "a");
+    await rLPush(lkey, "b");
+    await rExpire(lkey, 30);
+    const lr = await rLRange(lkey, 0, 9);
+    res.json({ ok: true, setexValue: got, list: lr });
   } catch (e) {
-    console.error('push error:', e);
-    return res.status(500).json({ ok: false, error: String(e.message || e) });
+    console.error("[selftest] error:", e);
+    res.status(500).json({ ok: false, error: e.message, stack: String(e.stack || "") });
   }
 });
 
-// ------------------------------
-// LIST inbox (το έχεις ήδη – δείχνω μία καθαρή εκδοχή)
-// GET /inbox/:local
-// ------------------------------
-app.get('/inbox/:local', async (req, res) => {
-  try {
-    const local = req.params.local.toLowerCase();
-    const ids = await redis.lrange(inboxKey(local), 0, 49);
-    const items = [];
-    for (const id of ids) {
-      const m = await redis.get(msgKey(id));
-      if (m) {
-        items.push({
-          id: m.id,
-          from: m.from,
-          subject: m.subject,
-          preview: m.preview,
-          received_at: m.received_at
-        });
-      }
-    }
-    res.json({ ok: true, messages: items });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
+app.use(helmet());
+app.use(cors({
+  origin: (origin, cb) => {
+    const allow = (process.env.FRONTEND_ORIGIN || "*")
+      .split(",").map(s => s.trim());
+    if (!origin || allow.includes("*") || allow.includes(origin)) return cb(null, true);
+    return cb(new Error("CORS blocked for origin: " + origin));
   }
-});
+}));
+app.use(bodyParser.json({ limit: "1mb" }));
 
-// ------------------------------
-// FULL message
-// GET /message/:id
-// ------------------------------
-app.get('/message/:id', async (req, res) => {
-  try {
-    const m = await redis.get(msgKey(req.params.id));
-    if (!m) return res.status(404).json({ ok: false, error: 'not found' });
-    res.json({
-      ok: true,
-      id: m.id,
-      from: m.from,
-      subject: m.subject,
-      received_at: m.received_at,
-      headers: m.headers,
-      body_plain: m.body_plain,
-      body_html: m.body_html,
-      attachments: m.attachments || []
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
+app.use(rateLimit({
+  windowMs: 60 * 1000,
+  limit: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  // Μην φρενάρεις health/debug, για να μην παίρνουμε 500 από το lib
+  skip: (req) => req.path === "/" || req.path === "/healthz" || req.path.startsWith("/_debug")
+}));
 
-// ------------------------------
-// Attachment download
-// GET /attachment/:attId  -> binary
-// ------------------------------
-app.get('/attachment/:attId', async (req, res) => {
-  try {
-    const obj = await redis.get(attKey(req.params.attId));
-    if (!obj || !obj.b64 || !obj.meta) return res.status(404).send('Not found');
+/* -------------------- Helpers -------------------- */
+const INBOX_TTL = Number(process.env.INBOX_TTL || 600);
+const MSG_TTL   = Number(process.env.MSG_TTL   || 600);
+const DOMAIN    = process.env.DOMAIN || "temp-mail.gr";
 
-    const buf = Buffer.from(obj.b64, 'base64');
-    res.setHeader('Content-Type', obj.meta.contentType || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `inline; filename="${obj.meta.filename || 'file'}"`);
-    res.send(buf);
-  } catch (e) {
-    res.status(500).send('error');
-  }
-});
+const nowISO = () => new Date().toISOString();
+const mailboxKeyFromLocal = (local) => `inbox:${local}`;
+const messageKey = (id) => `msg:${id}`;
 
-// ------------------------------
-// CREATE (παραμένει όπως το έχεις – δείγμα)
-app.post('/create', async (_req, res) => {
+/* -------------------- Core API -------------------- */
+
+// POST /create -> { ok, email, local, expires_in }
+async function handleCreate(_req, res) {
   const local = Math.random().toString(36).slice(2, 10);
   const email = `${local}@${DOMAIN}`;
-  const expires_in = Number(INBOX_TTL);
-  res.json({ ok: true, local, email, expires_in });
-});
-// ------------------------------
+  const key = mailboxKeyFromLocal(local);
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('API listening on', PORT));
+  try {
+    // 1) Καθάρισε/ετοίμασε inbox
+    await rDel(key);                           // ok αν δεν υπάρχει
+    // 2) Βάλε ένα marker για να υπάρχει key (ώστε να μην κολλήσει EXPIRE)
+    await rLPush(key, "__init__");             // δημιουργεί τη λίστα
+    await rLTrim(key, 1, -1);                  // σβήσε το marker, λίστα άδεια
+    // 3) TTL
+    await rExpire(key, INBOX_TTL);             // λίστα με TTL, ακόμα κι αν είναι άδεια
+
+    return res.json({ ok: true, email, local, expires_in: INBOX_TTL });
+  } catch (e) {
+    console.error("[create] error:", e);
+    return res.status(500).json({ ok: false, error: e.message || "create_failed" });
+  }
+}
+
+// GET /inbox/:local -> { ok, messages: [...] }
+async function handleInbox(req, res) {
+  try {
+    const local = req.params.local;
+    if (!local) return res.status(400).json({ ok: false, error: "missing_local" });
+
+    const key = mailboxKeyFromLocal(local);
+    const ids = await rLRange(key, 0, 49);
+    const messages = [];
+
+    for (const id of ids) {
+      if (id === "__init__") continue;  // αγνόησε τυχόν marker
+      const raw = await rGet(messageKey(id));
+      if (!raw) continue;
+      const m = typeof raw === "string" ? JSON.parse(raw) : raw;
+      messages.push({
+        id: m.id,
+        from: m.from || "",
+        subject: m.subject || "",
+        preview: (m.text || "").slice(0, 160),
+        received_at: m.received_at || m.date || nowISO(),
+      });
+    }
+    return res.json({ ok: true, messages });
+  } catch (e) {
+    console.error("inbox error:", e);
+    return res.status(500).json({ ok: false, error: e.message || "inbox_failed" });
+  }
+}
+
+// GET /message/:id -> full body
+async function handleMessage(req, res) {
+  try {
+    const id = req.params.id;
+    if (!id) return res.status(400).json({ ok: false, error: "missing_id" });
+
+    const raw = await rGet(messageKey(id));
+    if (!raw) return res.status(404).json({ ok: false, error: "not_found" });
+
+    const m = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return res.json({
+      ok: true,
+      id: m.id,
+      from: m.from || "",
+      subject: m.subject || "",
+      body_plain: m.text || "",
+      body_html: m.html || "",
+      received_at: m.received_at || m.date || nowISO(),
+      headers: m.headers || {}
+    });
+  } catch (e) {
+    console.error("message error:", e);
+    return res.status(500).json({ ok: false, error: e.message || "message_failed" });
+  }
+}
+
+/* ---- Routes (και /api/* aliases) ---- */
+app.post("/create", handleCreate);
+app.get("/inbox/:local", handleInbox);
+app.get("/message/:id", handleMessage);
+
+app.post("/api/create", handleCreate);
+app.get("/api/inbox/:local", handleInbox);
+app.get("/api/message/:id", handleMessage);
+
+/* -------------------- DEV: /_test/push -------------------- */
+if (process.env.DEV_MODE) {
+  app.get("/_test/push", async (req, res) => {
+    try {
+      const toAddress = String(req.query.to || "").toLowerCase();
+      const subject   = String(req.query.subject || "(no subject)");
+      const text      = String(req.query.text || "");
+      if (!/^[^@]+@[^@]+\.[^@]+$/.test(toAddress)) {
+        return res.status(400).json({ ok: false, error: "Invalid 'to' address" });
+      }
+      const id = Math.random().toString(36).slice(2);
+      const msg = {
+        id,
+        from: "tester@example.com",
+        to: toAddress,
+        subject,
+        text,
+        html: `<p>${text}</p>`,
+        received_at: nowISO(),
+      };
+      const local = toAddress.split("@")[0];
+
+      await rSetEX(messageKey(id), JSON.stringify(msg), MSG_TTL);
+      const mbox = mailboxKeyFromLocal(local);
+      await rLPush(mbox, id);
+      await rLTrim(mbox, 0, 199);
+      await rExpire(mbox, INBOX_TTL);
+
+      return res.json({ ok: true, accepted: true, id, to: toAddress });
+    } catch (e) {
+      console.error("[_test/push] error:", e);
+      return res.status(500).json({ ok: false, error: e.message || "push_failed" });
+    }
+  });
+}
+
+/* -------------------- (Προαιρετικό) SMTP για internal tests -------------------- */
+const SMTP_PORT = process.env.SMTP_PORT || 2525;
+const smtp = new SMTPServer({
+  disabledCommands: ["AUTH"],
+  logger: false,
+  onData(stream, session, callback) {
+    simpleParser(stream)
+      .then(async (mail) => {
+        try {
+          const to = (mail.to?.value?.[0]?.address || "").toLowerCase();
+          if (!to) return callback();
+
+          const id  = Math.random().toString(36).slice(2);
+          const msg = {
+            id,
+            from: mail.from?.text || "",
+            to,
+            subject: mail.subject || "",
+            text: mail.text || "",
+            html: mail.html || "",
+            received_at: nowISO(),
+            headers: Object.fromEntries(mail.headerLines?.map(h => [h.key, h.line]) || []),
+          };
+          const local = to.split("@")[0];
+
+          await rSetEX(messageKey(id), JSON.stringify(msg), MSG_TTL);
+          const mbox = mailboxKeyFromLocal(local);
+          await rLPush(mbox, id);
+          await rLTrim(mbox, 0, 199);
+          await rExpire(mbox, INBOX_TTL);
+
+          console.log(`[smtp] stored message for ${to}`);
+          callback();
+        } catch (e) {
+          console.error("[smtp] store error:", e);
+          callback(e);
+        }
+      })
+      .catch((err) => {
+        console.error("[smtp] parse error:", err);
+        callback(err);
+      });
+  },
+});
+smtp.listen(SMTP_PORT, "0.0.0.0", () => {
+  console.log(`[smtp] listening on :${SMTP_PORT}`);
+});
+
+/* -------------------- Start -------------------- */
+app.listen(WEB_PORT, () => {
+  console.log(`[http] listening on :${WEB_PORT}`);
+});

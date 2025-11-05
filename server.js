@@ -30,7 +30,7 @@ const rDel        = async (k)        => await redis.del(k);
 const app = express();
 const WEB_PORT = process.env.PORT || 3000;
 
-app.set("trust proxy", 1);       // Απαραίτητο για Render & rate-limit
+app.set("trust proxy", 1); // Απαραίτητο για Render & rate-limit
 app.disable("x-powered-by");
 
 /* --- Health/debug ΠΡΙΝ το rate-limit --- */
@@ -53,11 +53,8 @@ app.get("/_debug/redis", (_req, res) =>
 app.get("/_debug/selftest", async (_req, res) => {
   try {
     const key = `selftest:${Date.now()}`;
-    // 1) SETEX
     await rSetEX(key, JSON.stringify({ ok: true }), 30);
-    // 2) GET
     const got = await rGet(key);
-    // 3) LIST ops
     const lkey = `selflist:${Date.now()}`;
     await rLPush(lkey, "a");
     await rLPush(lkey, "b");
@@ -73,8 +70,7 @@ app.get("/_debug/selftest", async (_req, res) => {
 app.use(helmet());
 app.use(cors({
   origin: (origin, cb) => {
-    const allow = (process.env.FRONTEND_ORIGIN || "*")
-      .split(",").map(s => s.trim());
+    const allow = (process.env.FRONTEND_ORIGIN || "*").split(",").map(s => s.trim());
     if (!origin || allow.includes("*") || allow.includes(origin)) return cb(null, true);
     return cb(new Error("CORS blocked for origin: " + origin));
   }
@@ -86,7 +82,7 @@ app.use(rateLimit({
   limit: 120,
   standardHeaders: true,
   legacyHeaders: false,
-  // Μην φρενάρεις health/debug, για να μην παίρνουμε 500 από το lib
+  // Μην φρενάρεις health/debug
   skip: (req) => req.path === "/" || req.path === "/healthz" || req.path.startsWith("/_debug")
 }));
 
@@ -99,6 +95,16 @@ const nowISO = () => new Date().toISOString();
 const mailboxKeyFromLocal = (local) => `inbox:${local}`;
 const messageKey = (id) => `msg:${id}`;
 
+/* -------------------- NEW: API key helper για /push -------------------- */
+const API_KEY = process.env.API_KEY || "";  // ορίσ’ το στο Render
+function checkApiKey(req, res) {
+  if (!API_KEY) return true; // αν δεν έχεις API_KEY, μην μπλοκάρεις
+  const given = req.get("x-api-key") || "";
+  if (given && given === API_KEY) return true;
+  res.status(401).json({ ok: false, error: "unauthorized" });
+  return false;
+}
+
 /* -------------------- Core API -------------------- */
 
 // POST /create -> { ok, email, local, expires_in }
@@ -108,14 +114,10 @@ async function handleCreate(_req, res) {
   const key = mailboxKeyFromLocal(local);
 
   try {
-    // 1) Καθάρισε/ετοίμασε inbox
-    await rDel(key);                           // ok αν δεν υπάρχει
-    // 2) Βάλε ένα marker για να υπάρχει key (ώστε να μην κολλήσει EXPIRE)
-    await rLPush(key, "__init__");             // δημιουργεί τη λίστα
-    await rLTrim(key, 1, -1);                  // σβήσε το marker, λίστα άδεια
-    // 3) TTL
-    await rExpire(key, INBOX_TTL);             // λίστα με TTL, ακόμα κι αν είναι άδεια
-
+    await rDel(key);
+    await rLPush(key, "__init__");
+    await rLTrim(key, 1, -1);
+    await rExpire(key, INBOX_TTL);
     return res.json({ ok: true, email, local, expires_in: INBOX_TTL });
   } catch (e) {
     console.error("[create] error:", e);
@@ -134,7 +136,7 @@ async function handleInbox(req, res) {
     const messages = [];
 
     for (const id of ids) {
-      if (id === "__init__") continue;  // αγνόησε τυχόν marker
+      if (id === "__init__") continue;
       const raw = await rGet(messageKey(id));
       if (!raw) continue;
       const m = typeof raw === "string" ? JSON.parse(raw) : raw;
@@ -183,12 +185,54 @@ async function handleMessage(req, res) {
 app.post("/create", handleCreate);
 app.get("/inbox/:local", handleInbox);
 app.get("/message/:id", handleMessage);
-
 app.post("/api/create", handleCreate);
 app.get("/api/inbox/:local", handleInbox);
 app.get("/api/message/:id", handleMessage);
 
-/* -------------------- DEV: /_test/push -------------------- */
+/* -------------------- NEW: POST /push (δέχεται πλήρες μήνυμα από Worker) -------------------- */
+app.post("/push", async (req, res) => {
+  try {
+    if (!checkApiKey(req, res)) return;
+
+    const to = String(req.body.to || "").toLowerCase();
+    if (!/^[^@]+@[^@]+\.[^@]+$/.test(to)) {
+      return res.status(400).json({ ok: false, error: "invalid_to" });
+    }
+    const subject = String(req.body.subject || "");
+    const text    = String(req.body.text || "");
+    const html    = String(req.body.html || "");
+    const from    = String(req.body.from || "");
+    const headers = (req.body.headers && typeof req.body.headers === "object")
+      ? req.body.headers
+      : {};
+
+    const id  = Math.random().toString(36).slice(2);
+    const msg = {
+      id,
+      to,
+      from,
+      subject,
+      text,
+      html,
+      received_at: nowISO(),
+      headers
+    };
+
+    await rSetEX(messageKey(id), JSON.stringify(msg), MSG_TTL);
+    const local = to.split("@")[0];
+    const mbox  = mailboxKeyFromLocal(local);
+    await rLPush(mbox, id);
+    await rLTrim(mbox, 0, 199);
+    await rExpire(mbox, INBOX_TTL);
+
+    return res.json({ ok: true, id, stored: true });
+  } catch (e) {
+    console.error("[/push] error:", e);
+    return res.status(500).json({ ok: false, error: e.message || "push_failed" });
+  }
+});
+
+/* -------------------- DEV: /_test/push (κρατάμε όπως ήταν) -------------------- */
 if (process.env.DEV_MODE) {
   app.get("/_test/push", async (req, res) => {
     try {

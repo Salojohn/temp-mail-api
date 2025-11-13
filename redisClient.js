@@ -1,28 +1,35 @@
-import Redis from "ioredis";
+// redisClients.js
+import { Redis as UpstashRedis } from "@upstash/redis";
 
-const redisUrl = process.env.REDIS_URL || "redis://127.0.0.1:6379";
-const useTls = redisUrl.startsWith("rediss://");
+const redisUrl   = process.env.UPSTASH_REDIS_REST_URL || "";
+const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN || "";
 
-export const redis = new Redis(redisUrl, {
-  ...(useTls ? { tls: {} } : {}),
-  maxRetriesPerRequest: null,
-  retryStrategy: (times) => Math.min(times * 200, 2000),
-  reconnectOnError: (err) =>
-    /READONLY|ECONNRESET|EPIPE|Connection is closed/i.test(err?.message || ""),
-  enableReadyCheck: false,
-  keepAlive: 10000,
-  connectTimeout: 10000
+if (!redisUrl || !redisToken) {
+  console.warn("[redis] Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN");
+}
+
+export const redis = new UpstashRedis({
+  url: redisUrl,
+  token: redisToken,
 });
 
-let firstConnect = true;
-let lastWarn = 0;
+// Helper wrappers ώστε να έχεις ένα consistent API παντού
+export const rGet    = async (k)          => await redis.get(k);
+export const rSetEX  = async (k, v, ex)   => await redis.set(k, v, { ex });
+export const rLPush  = async (k, v)       => await redis.lpush(k, v);
+export const rLTrim  = async (k, start, end) => await redis.ltrim(k, start, end);
+export const rLRange = async (k, start, end) => await redis.lrange(k, start, end);
+export const rExpire = async (k, sec)     => await redis.expire(k, sec);
+export const rDel    = async (k)          => await redis.del(k);
 
-redis.on("connect", () => { if (firstConnect){ console.log("[redis] connected"); firstConnect = false; }});
-redis.on("reconnecting", (ms) => { const now = Date.now(); if (now - lastWarn > 60000){ console.warn(`[redis] reconnecting in ${ms}ms`); lastWarn = now; }});
-redis.on("end", () => console.warn("[redis] connection closed"));
-redis.on("error", (e) => { const now = Date.now(); if (now - lastWarn > 60000){ console.warn("[redis] transient issue:", e.code || e.message); lastWarn = now; }});
-
-setInterval(() => { redis.ping().catch(() => {}); }, 20000);
-
-process.on("unhandledRejection", (e) => console.warn("[sys] unhandledRejection:", e?.message || e));
-process.on("uncaughtException", (e) => console.warn("[sys] uncaughtException:", e?.message || e));
+// Μικρό self-test (προαιρετικό, αλλά χρήσιμο για debug)
+export async function redisSelfTest() {
+  try {
+    const key = `selftest:${Date.now()}`;
+    await rSetEX(key, JSON.stringify({ ok: true }), 30);
+    const v = await rGet(key);
+    console.log("[redis selftest] OK:", v);
+  } catch (e) {
+    console.error("[redis selftest] FAILED:", e);
+  }
+}

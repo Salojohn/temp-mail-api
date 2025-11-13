@@ -1,3 +1,5 @@
+
+// server.js
 import express from "express";
 import bodyParser from "body-parser";
 import cors from "cors";
@@ -5,8 +7,7 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { SMTPServer } from "smtp-server";
 import { simpleParser } from "mailparser";
-import { rGet, rSetEX, rLPush, rLTrim, rLRange, rExpire, rDel } from "./redisClients.js";
-
+import { Redis as UpstashRedis } from "@upstash/redis";
 
 /* -------------------- Upstash Redis (REST) -------------------- */
 const redisUrl = process.env.UPSTASH_REDIS_REST_URL || "";

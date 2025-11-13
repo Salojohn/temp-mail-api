@@ -5,7 +5,8 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { SMTPServer } from "smtp-server";
 import { simpleParser } from "mailparser";
-import { Redis as UpstashRedis } from "@upstash/redis";
+import { rGet, rSetEX, rLPush, rLTrim, rLRange, rExpire, rDel } from "./redisClients.js";
+
 
 /* -------------------- Upstash Redis (REST) -------------------- */
 const redisUrl = process.env.UPSTASH_REDIS_REST_URL || "";

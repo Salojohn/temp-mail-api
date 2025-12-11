@@ -225,55 +225,59 @@ if (process.env.DEV_MODE) {
   });
 }
 
-/* -------------------- (Προαιρετικό) SMTP για internal tests -------------------- */
-const SMTP_PORT = process.env.SMTP_PORT || 2525;
-const smtp = new SMTPServer({
-  disabledCommands: ["AUTH"],
-  logger: false,
-  onData(stream, session, callback) {
-    simpleParser(stream)
-      .then(async (mail) => {
-        try {
-          const to = (mail.to?.value?.[0]?.address || "").toLowerCase();
-          if (!to) return callback();
+/* -------------------- Email εισερχομένων από Cloudflare Worker -------------------- */
+// Προαιρετικό απλό "API key" για να μην μας κάνει POST όποιος θέλει
+const API_KEY = process.env.API_KEY || "";
 
-          const id  = Math.random().toString(36).slice(2);
-          const msg = {
-            id,
-            from: mail.from?.text || "",
-            to,
-            subject: mail.subject || "",
-            text: mail.text || "",
-            html: mail.html || "",
-            received_at: nowISO(),
-            headers: Object.fromEntries(mail.headerLines?.map(h => [h.key, h.line]) || []),
-          };
-          const local = to.split("@")[0];
+app.post("/incoming-email", async (req, res) => {
+  try {
+    if (API_KEY) {
+      const sent = req.headers["x-api-key"];
+      if (!sent || sent !== API_KEY) {
+        return res.status(401).json({ ok: false, error: "unauthorized" });
+      }
+    }
 
-          await rSetEX(messageKey(id), JSON.stringify(msg), MSG_TTL);
-          const mbox = mailboxKeyFromLocal(local);
-          await rLPush(mbox, id);
-          await rLTrim(mbox, 0, 199);
-          await rExpire(mbox, INBOX_TTL);
+    const {
+      id,
+      to,
+      from,
+      subject = "",
+      text = "",
+      html = "",
+      received_at,
+      headers = {},
+    } = req.body || {};
 
-          console.log(`[smtp] stored message for ${to}`);
-          callback();
-        } catch (e) {
-          console.error("[smtp] store error:", e);
-          callback(e);
-        }
-      })
-      .catch((err) => {
-        console.error("[smtp] parse error:", err);
-        callback(err);
-      });
-  },
-});
-smtp.listen(SMTP_PORT, "0.0.0.0", () => {
-  console.log(`[smtp] listening on :${SMTP_PORT}`);
-});
+    if (!to || !from) {
+      return res.status(400).json({ ok: false, error: "missing_to_or_from" });
+    }
 
-/* -------------------- Start -------------------- */
-app.listen(WEB_PORT, () => {
-  console.log(`[http] listening on :${WEB_PORT}`);
+    const msgId = id || Math.random().toString(36).slice(2);
+    const local = to.toLowerCase().split("@")[0];
+
+    const msg = {
+      id: msgId,
+      from,
+      to,
+      subject,
+      text,
+      html,
+      received_at: received_at || nowISO(),
+      headers,
+    };
+
+    // Αποθήκευση όπως στο SMTP / _test/push
+    await rSetEX(messageKey(msgId), JSON.stringify(msg), MSG_TTL);
+    const mbox = mailboxKeyFromLocal(local);
+    await rLPush(mbox, msgId);
+    await rLTrim(mbox, 0, 199);
+    await rExpire(mbox, INBOX_TTL);
+
+    console.log(`[incoming-email] stored for ${to}`);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("[incoming-email] error:", e);
+    return res.status(500).json({ ok: false, error: e.message || "incoming_failed" });
+  }
 });

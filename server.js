@@ -240,3 +240,45 @@ app.post("/incoming-email", async (req, res) => {
 app.listen(WEB_PORT, () => {
   console.log(`[http] listening on :${WEB_PORT}`);
 });
+
+
+/* -------------------- Mailgun inbound webhook -------------------- */
+
+app.post(
+  "/mailgun/inbound",
+  express.urlencoded({ extended: true }),
+  async (req, res) => {
+    try {
+      const data = req.body;
+
+      const to = (data.recipient || "").toLowerCase();
+      const from = data.sender || "";
+      const subject = data.subject || "";
+      const text = data["body-plain"] || "";
+      const html = data["body-html"] || "";
+
+      const local = to.split("@")[0];
+      const id = Date.now().toString(36);
+
+      const msg = {
+        id,
+        from,
+        to,
+        subject,
+        text,
+        html,
+        received_at: new Date().toISOString(),
+      };
+
+      await rSetEX(`msg:${id}`, JSON.stringify(msg), MSG_TTL);
+      await rLPush(`inbox:${local}`, id);
+      await rLTrim(`inbox:${local}`, 0, 199);
+      await rExpire(`inbox:${local}`, INBOX_TTL);
+
+      return res.json({ ok: true });
+    } catch (e) {
+      console.error("Mailgun inbound error:", e);
+      return res.status(500).json({ ok: false, error: e.message });
+    }
+  }
+);

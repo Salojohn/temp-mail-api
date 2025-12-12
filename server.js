@@ -47,6 +47,17 @@ app.get("/_debug/redis", (_req, res) =>
   res.json({ ok: true, hasUrl: !!redisUrl, hasToken: !!redisToken })
 );
 
+app.get("/_debug/apikey", (_req, res) => {
+  const k = process.env.API_KEY || "";
+  res.json({
+    hasKey: !!k,
+    len: k.length,
+    head: k.slice(0, 4),
+    tail: k.slice(-4),
+  });
+});
+
+
 /* --- Self-test για Upstash --- */
 app.get("/_debug/selftest", async (_req, res) => {
   try {

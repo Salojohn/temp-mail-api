@@ -333,6 +333,16 @@ app.post(
   }
 );
 
+app.post("/_debug/pushcheck", upload.single("raw"), (req, res) => {
+  res.json({
+    body_api_key: req.body?.api_key || null,
+    header_x_api_key: req.headers["x-api-key"] || null,
+    content_type: req.headers["content-type"] || null,
+    has_file: !!req.file,
+    body_keys: Object.keys(req.body || {}),
+  });
+});
+
 
 /* -------------------- Start -------------------- */
 app.listen(WEB_PORT, () => {

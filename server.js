@@ -276,6 +276,50 @@ app.post("/cloudflare/inbound", express.raw({ type: "*/*", limit: "25mb" }), asy
   }
 });
 
+import multer from "multer";
+const upload = multer();
+
+app.post(
+  "/push",
+  upload.single("raw"),
+  async (req, res) => {
+    try {
+      // 1️⃣ API KEY CHECK
+      if (req.body.api_key !== process.env.API_KEY) {
+        return res.status(401).json({ ok: false, error: "unauthorized" });
+      }
+
+      const to = (req.body.to || "").toLowerCase();
+      if (!to.includes("@")) {
+        return res.status(400).json({ ok: false, error: "invalid_to" });
+      }
+
+      const local = to.split("@")[0];
+      const id = Date.now().toString(36);
+
+      const raw = req.file?.buffer?.toString("utf8") || "";
+
+      const msg = {
+        id,
+        to,
+        from: req.body.from || "",
+        subject: req.body.subject || "",
+        raw,                 // ⬅️ ΟΛΟ το MIME (links, images, headers κλπ)
+        received_at: new Date().toISOString(),
+      };
+
+      await rSetEX(`msg:${id}`, JSON.stringify(msg), MSG_TTL);
+      await rLPush(`inbox:${local}`, id);
+      await rLTrim(`inbox:${local}`, 0, 199);
+      await rExpire(`inbox:${local}`, INBOX_TTL);
+
+      res.json({ ok: true });
+    } catch (e) {
+      console.error("PUSH ERROR:", e);
+      res.status(500).json({ ok: false });
+    }
+  }
+);
 
 
 /* -------------------- Start -------------------- */

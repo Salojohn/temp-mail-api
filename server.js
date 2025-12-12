@@ -236,6 +236,48 @@ app.post("/incoming-email", async (req, res) => {
   }
 });
 
+
+import { simpleParser } from "mailparser";
+
+// raw body (Cloudflare Worker θα στείλει raw email)
+app.post("/cloudflare/inbound", express.raw({ type: "*/*", limit: "25mb" }), async (req, res) => {
+  try {
+    const raw = req.body; // Buffer
+    const mail = await simpleParser(raw);
+
+    // Το "to" μπορεί να είναι πολλά. Παίρνουμε το πρώτο address.
+    const to = (mail.to?.value?.[0]?.address || "").toLowerCase();
+    if (!to.includes("@")) return res.status(400).json({ ok:false, error:"missing_to" });
+
+    const local = to.split("@")[0];
+    const id = Math.random().toString(36).slice(2);
+
+    const msg = {
+      id,
+      from: mail.from?.text || "",
+      to,
+      subject: mail.subject || "",
+      text: mail.text || "",
+      html: mail.html || "",
+      received_at: new Date().toISOString(),
+      headers: Object.fromEntries(mail.headerLines?.map(h => [h.key, h.line]) || []),
+    };
+
+    await rSetEX(messageKey(id), JSON.stringify(msg), MSG_TTL);
+    const mbox = mailboxKeyFromLocal(local);
+    await rLPush(mbox, id);
+    await rLTrim(mbox, 0, 199);
+    await rExpire(mbox, INBOX_TTL);
+
+    return res.json({ ok: true, stored: true, id, to });
+  } catch (e) {
+    console.error("[cloudflare inbound] error:", e);
+    return res.status(500).json({ ok:false, error: e.message });
+  }
+});
+
+
+
 /* -------------------- Start -------------------- */
 app.listen(WEB_PORT, () => {
   console.log(`[http] listening on :${WEB_PORT}`);

@@ -44,7 +44,7 @@ const mailboxKeyFromLocal = (local) => `inbox:${local}`;
 const messageKey = (id) => `msg:${id}`;
 
 function requireApiKey(req, res) {
-  if (!API_KEY) return true; // αν δεν έχεις βάλει API_KEY, το αφήνει open (δεν το προτείνω)
+  if (!API_KEY) return true;
   const sent = req.headers["x-api-key"];
   if (!sent || sent !== API_KEY) {
     res.status(401).json({ ok: false, error: "unauthorized" });
@@ -53,12 +53,7 @@ function requireApiKey(req, res) {
   return true;
 }
 
-/* -------------------- Raw inbound route FIRST (πριν json/urlencoded) -------------------- */
-/**
- * Cloudflare Email Worker → POST raw MIME στο /cloudflare/inbound
- * Content-Type: message/rfc822 (ή οτιδήποτε, το πιάνουμε με */*)
- * Header: x-api-key: <API_KEY>
- */
+/* -------------------- RAW inbound (Cloudflare) BEFORE json/urlencoded -------------------- */
 app.post(
   "/cloudflare/inbound",
   express.raw({ type: "*/*", limit: "25mb" }),
@@ -101,9 +96,8 @@ app.post(
   }
 );
 
-/* -------------------- Security / middleware -------------------- */
+/* -------------------- Middleware -------------------- */
 app.use(helmet());
-
 app.use(cors({
   origin: (origin, cb) => {
     const allow = (process.env.FRONTEND_ORIGIN || "*")
@@ -112,7 +106,6 @@ app.use(cors({
     return cb(new Error("CORS blocked for origin: " + origin));
   }
 }));
-
 app.use(bodyParser.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -136,10 +129,6 @@ app.get("/_debug/ping", (_req, res) =>
     domain: process.env.DOMAIN || null,
     allowedList: (process.env.FRONTEND_ORIGIN || "*").split(",").map(s => s.trim()),
   })
-);
-
-app.get("/_debug/redis", (_req, res) =>
-  res.json({ ok: true, hasUrl: !!redisUrl, hasToken: !!redisToken })
 );
 
 app.get("/_debug/apikey", (_req, res) => {
@@ -167,8 +156,7 @@ app.get("/_debug/selftest", async (_req, res) => {
 });
 
 /* -------------------- Core API -------------------- */
-// POST /create -> { ok, email, local, expires_in }
-async function handleCreate(_req, res) {
+app.post("/create", async (_req, res) => {
   const local = Math.random().toString(36).slice(2, 10);
   const email = `${local}@${DOMAIN}`;
   const key = mailboxKeyFromLocal(local);
@@ -184,10 +172,9 @@ async function handleCreate(_req, res) {
     console.error("[create] error:", e);
     return res.status(500).json({ ok: false, error: e.message || "create_failed" });
   }
-}
+});
 
-// GET /inbox/:local -> { ok, messages: [...] }
-async function handleInbox(req, res) {
+app.get("/inbox/:local", async (req, res) => {
   try {
     const local = req.params.local;
     if (!local) return res.status(400).json({ ok: false, error: "missing_local" });
@@ -200,7 +187,6 @@ async function handleInbox(req, res) {
       if (id === "__init__") continue;
       const raw = await rGet(messageKey(id));
       if (!raw) continue;
-
       const m = typeof raw === "string" ? JSON.parse(raw) : raw;
 
       messages.push({
@@ -217,10 +203,9 @@ async function handleInbox(req, res) {
     console.error("inbox error:", e);
     return res.status(500).json({ ok: false, error: e.message || "inbox_failed" });
   }
-}
+});
 
-// GET /message/:id -> full body
-async function handleMessage(req, res) {
+app.get("/message/:id", async (req, res) => {
   try {
     const id = req.params.id;
     if (!id) return res.status(400).json({ ok: false, error: "missing_id" });
@@ -240,33 +225,22 @@ async function handleMessage(req, res) {
       body_html: m.html || "",
       raw: m.raw || "",
       received_at: m.received_at || m.date || nowISO(),
-      headers: m.headers || {},
+      headers: m.headers || {}
     });
   } catch (e) {
     console.error("message error:", e);
     return res.status(500).json({ ok: false, error: e.message || "message_failed" });
   }
-}
+});
 
-/* Routes + /api aliases */
-app.post("/create", handleCreate);
-app.get("/inbox/:local", handleInbox);
-app.get("/message/:id", handleMessage);
+/* aliases */
+app.post("/api/create", (req, res) => app._router.handle(req, res, () => {}));
+app.get("/api/inbox/:local", (req, res) => app._router.handle(req, res, () => {}));
+app.get("/api/message/:id", (req, res) => app._router.handle(req, res, () => {}));
 
-app.post("/api/create", handleCreate);
-app.get("/api/inbox/:local", handleInbox);
-app.get("/api/message/:id", handleMessage);
-
-/* -------------------- PUSH endpoint (multipart/form-data) -------------------- */
+/* -------------------- PUSH (multipart/form-data raw file) -------------------- */
 const upload = multer();
 
-/**
- * POST /push
- * multipart/form-data:
- *  - raw: (file) mail.eml
- *  - to, from, subject
- * Header: x-api-key: <API_KEY>
- */
 app.post("/push", upload.single("raw"), async (req, res) => {
   try {
     if (!requireApiKey(req, res)) return;
@@ -278,11 +252,12 @@ app.post("/push", upload.single("raw"), async (req, res) => {
     const id = Date.now().toString(36);
 
     const rawStr = req.file?.buffer?.toString("utf8") || "";
-    // Προαιρετικό parsing για να έχεις html/text έτοιμα
+
+    // parse για html/text (προαιρετικό αλλά χρήσιμο)
     let parsed = null;
     try {
       if (rawStr) parsed = await simpleParser(Buffer.from(rawStr, "utf8"));
-    } catch { /* ignore parse errors */ }
+    } catch {}
 
     const msg = {
       id,
@@ -293,9 +268,7 @@ app.post("/push", upload.single("raw"), async (req, res) => {
       html: parsed?.html || "",
       raw: rawStr,
       received_at: nowISO(),
-      headers: parsed
-        ? Object.fromEntries(parsed.headerLines?.map(h => [h.key, h.line]) || [])
-        : {},
+      headers: parsed ? Object.fromEntries(parsed.headerLines?.map(h => [h.key, h.line]) || []) : {},
     };
 
     await rSetEX(messageKey(id), JSON.stringify(msg), MSG_TTL);

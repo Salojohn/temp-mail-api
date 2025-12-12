@@ -284,6 +284,13 @@ app.post("/push", upload.single("raw"), async (req, res) => {
   }
 });
 
+app.get("/_debug/headers", (req, res) => {
+  res.json({
+    got: req.headers["x-api-key"] || null,
+    all: req.headers,
+  });
+});
+
 /* -------------------- Start -------------------- */
 app.listen(WEB_PORT, () => {
   console.log(`[http] listening on :${WEB_PORT}`);

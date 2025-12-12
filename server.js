@@ -86,6 +86,8 @@ app.use(cors({
   }
 }));
 app.use(bodyParser.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true }));
+
 
 app.use(rateLimit({
   windowMs: 60 * 1000,

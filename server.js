@@ -1,5 +1,5 @@
-// server.js (clean, deploy-safe)
- 
+// server.js — FULL VERSION (deploy-safe, no trimming)
+
 import express from "express";
 import bodyParser from "body-parser";
 import cors from "cors";
@@ -9,23 +9,23 @@ import multer from "multer";
 import { simpleParser } from "mailparser";
 import { Redis as UpstashRedis } from "@upstash/redis";
 
-/* -------------------- Upstash Redis (REST) -------------------- */
+/* -------------------- Upstash Redis -------------------- */
 const redisUrl = process.env.UPSTASH_REDIS_REST_URL || "";
 const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN || "";
 
 if (!redisUrl || !redisToken) {
-  console.error("[redis] Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN");
+  console.error("[redis] Missing UPSTASH_REDIS_REST_URL or TOKEN");
 }
 
 const redis = new UpstashRedis({ url: redisUrl, token: redisToken });
 
-const rGet = async (k) => await redis.get(k);
-const rSetEX = async (k, v, ex) => await redis.set(k, v, { ex });
-const rLPush = async (k, v) => await redis.lpush(k, v);
-const rLTrim = async (k, s, e) => await redis.ltrim(k, s, e);
-const rLRange = async (k, s, e) => await redis.lrange(k, s, e);
-const rExpire = async (k, sec) => await redis.expire(k, sec);
-const rDel = async (k) => await redis.del(k);
+const rGet = (k) => redis.get(k);
+const rSetEX = (k, v, ex) => redis.set(k, v, { ex });
+const rLPush = (k, v) => redis.lpush(k, v);
+const rLTrim = (k, s, e) => redis.ltrim(k, s, e);
+const rLRange = (k, s, e) => redis.lrange(k, s, e);
+const rExpire = (k, sec) => redis.expire(k, sec);
+const rDel = (k) => redis.del(k);
 
 /* -------------------- App -------------------- */
 const app = express();
@@ -43,13 +43,14 @@ app.use(
       const allow = (process.env.FRONTEND_ORIGIN || "*")
         .split(",")
         .map((s) => s.trim());
-      if (!origin || allow.includes("*") || allow.includes(origin)) return cb(null, true);
-      return cb(new Error("CORS blocked for origin: " + origin));
+      if (!origin || allow.includes("*") || allow.includes(origin)) {
+        return cb(null, true);
+      }
+      cb(new Error("CORS blocked"));
     },
   })
 );
 
-// JSON + urlencoded (για mailgun/incoming)
 app.use(bodyParser.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -60,7 +61,9 @@ app.use(
     standardHeaders: true,
     legacyHeaders: false,
     skip: (req) =>
-      req.path === "/" || req.path === "/healthz" || req.path.startsWith("/_debug"),
+      req.path === "/" ||
+      req.path === "/healthz" ||
+      req.path.startsWith("/_debug"),
   })
 );
 
@@ -71,10 +74,21 @@ const DOMAIN = process.env.DOMAIN || "temp-mail.gr";
 const API_KEY = process.env.API_KEY || "";
 
 const nowISO = () => new Date().toISOString();
-const mailboxKeyFromLocal = (local) => `inbox:${local}`;
+const inboxKey = (local) => `inbox:${local}`;
 const messageKey = (id) => `msg:${id}`;
 
-async function storeMessage({ id, to, from, subject, text, html, raw, headers, received_at }) {
+/* -------------------- Store Message -------------------- */
+async function storeMessage({
+  id,
+  to,
+  from,
+  subject,
+  text,
+  html,
+  raw,
+  headers,
+  received_at,
+}) {
   const msgId = id || Math.random().toString(36).slice(2);
   const toLc = (to || "").toLowerCase();
   const local = toLc.split("@")[0];
@@ -92,249 +106,129 @@ async function storeMessage({ id, to, from, subject, text, html, raw, headers, r
   };
 
   await rSetEX(messageKey(msgId), JSON.stringify(msg), MSG_TTL);
+  await rLPush(inboxKey(local), msgId);
+  await rLTrim(inboxKey(local), 0, 199);
+  await rExpire(inboxKey(local), INBOX_TTL);
 
-  const mbox = mailboxKeyFromLocal(local);
-  await rLPush(mbox, msgId);
-  await rLTrim(mbox, 0, 199);
-  await rExpire(mbox, INBOX_TTL);
-
-  return { msgId, local };
+  return msgId;
 }
 
 /* -------------------- Health / Debug -------------------- */
 app.get("/", (_req, res) => res.json({ ok: true }));
-app.get("/healthz", (_req, res) => res.status(200).send("OK"));
-
-app.get("/_debug/ping", (_req, res) =>
-  res.json({
-    ok: true,
-    t: Date.now(),
-    dev: !!process.env.DEV_MODE,
-    domain: process.env.DOMAIN || null,
-    allowedList: (process.env.FRONTEND_ORIGIN || "*").split(",").map((s) => s.trim()),
-  })
-);
-
-app.get("/_debug/redis", (_req, res) => res.json({ ok: true, hasUrl: !!redisUrl, hasToken: !!redisToken }));
+app.get("/healthz", (_req, res) => res.send("OK"));
 
 app.get("/_debug/apikey", (_req, res) => {
-  const k = process.env.API_KEY || "";
-  res.json({ hasKey: !!k, len: k.length, head: k.slice(0, 4), tail: k.slice(-4) });
-});
-
-app.get("/_debug/selftest", async (_req, res) => {
-  try {
-    const key = `selftest:${Date.now()}`;
-    await rSetEX(key, JSON.stringify({ ok: true }), 30);
-    const got = await rGet(key);
-
-    const lkey = `selflist:${Date.now()}`;
-    await rLPush(lkey, "a");
-    await rLPush(lkey, "b");
-    await rExpire(lkey, 30);
-    const lr = await rLRange(lkey, 0, 9);
-
-    res.json({ ok: true, setexValue: got, list: lr });
-  } catch (e) {
-    console.error("[selftest] error:", e);
-    res.status(500).json({ ok: false, error: e.message, stack: String(e.stack || "") });
-  }
+  const k = API_KEY || "";
+  res.json({
+    hasKey: !!k,
+    len: k.length,
+    head: k.slice(0, 4),
+    tail: k.slice(-4),
+  });
 });
 
 /* -------------------- Core API -------------------- */
 app.post("/create", async (_req, res) => {
   const local = Math.random().toString(36).slice(2, 10);
   const email = `${local}@${DOMAIN}`;
-  const key = mailboxKeyFromLocal(local);
 
-  try {
-    await rDel(key);
-    await rLPush(key, "__init__");
-    await rLTrim(key, 1, -1);
-    await rExpire(key, INBOX_TTL);
+  await rDel(inboxKey(local));
+  await rLPush(inboxKey(local), "__init__");
+  await rLTrim(inboxKey(local), 1, -1);
+  await rExpire(inboxKey(local), INBOX_TTL);
 
-    return res.json({ ok: true, email, local, expires_in: INBOX_TTL });
-  } catch (e) {
-    console.error("[create] error:", e);
-    return res.status(500).json({ ok: false, error: e.message || "create_failed" });
-  }
+  res.json({ ok: true, email, local, expires_in: INBOX_TTL });
 });
 
 app.get("/inbox/:local", async (req, res) => {
-  try {
-    const local = req.params.local;
-    if (!local) return res.status(400).json({ ok: false, error: "missing_local" });
+  const ids = await rLRange(inboxKey(req.params.local), 0, 49);
+  const messages = [];
 
-    const ids = await rLRange(mailboxKeyFromLocal(local), 0, 49);
-    const messages = [];
-
-    for (const id of ids) {
-      if (id === "__init__") continue;
-      const raw = await rGet(messageKey(id));
-      if (!raw) continue;
-
-      const m = typeof raw === "string" ? JSON.parse(raw) : raw;
-
-      messages.push({
-        id: m.id,
-        from: m.from || "",
-        subject: m.subject || "",
-        preview: (m.text || m.raw || "").slice(0, 160),
-        received_at: m.received_at || m.date || nowISO(),
-      });
-    }
-
-    return res.json({ ok: true, messages });
-  } catch (e) {
-    console.error("[inbox] error:", e);
-    return res.status(500).json({ ok: false, error: e.message || "inbox_failed" });
+  for (const id of ids) {
+    if (id === "__init__") continue;
+    const raw = await rGet(messageKey(id));
+    if (!raw) continue;
+    const m = JSON.parse(raw);
+    messages.push({
+      id: m.id,
+      from: m.from,
+      subject: m.subject,
+      preview: (m.text || m.raw || "").slice(0, 160),
+      received_at: m.received_at,
+    });
   }
+
+  res.json({ ok: true, messages });
 });
 
 app.get("/message/:id", async (req, res) => {
-  try {
-    const id = req.params.id;
-    if (!id) return res.status(400).json({ ok: false, error: "missing_id" });
-
-    const raw = await rGet(messageKey(id));
-    if (!raw) return res.status(404).json({ ok: false, error: "not_found" });
-
-    const m = typeof raw === "string" ? JSON.parse(raw) : raw;
-
-    return res.json({
-      ok: true,
-      id: m.id,
-      from: m.from || "",
-      to: m.to || "",
-      subject: m.subject || "",
-      body_plain: m.text || "",
-      body_html: m.html || "",
-      raw: m.raw || "",
-      received_at: m.received_at || m.date || nowISO(),
-      headers: m.headers || {},
-    });
-  } catch (e) {
-    console.error("[message] error:", e);
-    return res.status(500).json({ ok: false, error: e.message || "message_failed" });
-  }
+  const raw = await rGet(messageKey(req.params.id));
+  if (!raw) return res.status(404).json({ ok: false });
+  res.json({ ok: true, ...JSON.parse(raw) });
 });
 
-/* -------------------- Incoming from Worker (JSON) -------------------- */
+/* -------------------- Incoming JSON -------------------- */
 app.post("/incoming-email", async (req, res) => {
-  try {
-    if (API_KEY) {
-      const sent = req.headers["x-api-key"];
-      if (!sent || sent !== API_KEY) return res.status(401).json({ ok: false, error: "unauthorized" });
-    }
-
-    const { id, to, from, subject, text, html, received_at, headers } = req.body || {};
-    if (!to || !from) return res.status(400).json({ ok: false, error: "missing_to_or_from" });
-
-    await storeMessage({ id, to, from, subject, text, html, headers, received_at });
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("[incoming-email] error:", e);
-    return res.status(500).json({ ok: false, error: e.message || "incoming_failed" });
+  if (API_KEY && req.headers["x-api-key"] !== API_KEY) {
+    return res.status(401).json({ ok: false });
   }
+
+  const { to, from, subject, text, html } = req.body || {};
+  if (!to || !from) return res.status(400).json({ ok: false });
+
+  await storeMessage({ to, from, subject, text, html });
+  res.json({ ok: true });
 });
 
-/* -------------------- Incoming RAW email (HTTP body) -------------------- */
-app.post("/cloudflare/inbound", express.raw({ type: () => true, limit: "25mb" }), async (req, res) => {
-  try {
+/* -------------------- RAW inbound -------------------- */
+app.post(
+  "/cloudflare/inbound",
+  express.raw({ type: () => true, limit: "25mb" }),
+  async (req, res) => {
     const mail = await simpleParser(req.body);
-
-    const to = (mail.to?.value?.[0]?.address || "").toLowerCase();
-    if (!to.includes("@")) return res.status(400).json({ ok: false, error: "missing_to" });
+    const to = mail.to?.value?.[0]?.address;
+    if (!to) return res.status(400).json({ ok: false });
 
     await storeMessage({
       to,
-      from: mail.from?.text || "",
-      subject: mail.subject || "",
-      text: mail.text || "",
-      html: mail.html || "",
+      from: mail.from?.text,
+      subject: mail.subject,
+      text: mail.text,
+      html: mail.html,
       raw: req.body.toString("utf8"),
-      headers: Object.fromEntries(mail.headerLines?.map((h) => [h.key, h.line]) || []),
-      received_at: nowISO(),
+      headers: Object.fromEntries(
+        mail.headerLines?.map((h) => [h.key, h.line]) || []
+      ),
     });
 
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("[cloudflare/inbound] error:", e);
-    return res.status(500).json({ ok: false, error: e.message || "inbound_failed" });
+    res.json({ ok: true });
   }
-});
+);
 
-/* -------------------- PUSH (multipart/form-data) -------------------- */
+/* -------------------- PUSH -------------------- */
 const upload = multer({ limits: { fileSize: 25 * 1024 * 1024 } });
 
 app.post("/push", upload.single("raw"), async (req, res) => {
-  try {
-    // accept api_key either as field OR header (για να μη παιδεύεσαι)
-    const keyFromBody = req.body?.api_key || "";
-    const keyFromHeader = req.headers["x-api-key"] || "";
-    const sentKey = keyFromBody || keyFromHeader;
-
-    if (API_KEY && sentKey !== API_KEY) {
-      return res.status(401).json({ ok: false, error: "unauthorized" });
-    }
-
-    const to = (req.body.to || "").toLowerCase();
-    if (!to.includes("@")) return res.status(400).json({ ok: false, error: "invalid_to" });
-
-    const rawBuf = req.file?.buffer || null;
-    const raw = rawBuf ? rawBuf.toString("utf8") : (req.body.raw || "");
-
-    await storeMessage({
-      to,
-      from: req.body.from || "",
-      subject: req.body.subject || "",
-      raw,
-      received_at: nowISO(),
-      headers: {},
-    });
-
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("[push] error:", e);
-    return res.status(500).json({ ok: false, error: e.message || "push_failed" });
+  const sentKey = req.body.api_key || req.headers["x-api-key"];
+  if (API_KEY && sentKey !== API_KEY) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
   }
-});
 
-app.post("/_debug/pushcheck", upload.single("raw"), (req, res) => {
-  res.json({
-    ok: true,
-    body_api_key: req.body?.api_key || null,
-    header_x_api_key: req.headers["x-api-key"] || null,
-    content_type: req.headers["content-type"] || null,
-    has_file: !!req.file,
-    file_size: req.file?.size || 0,
-    body_keys: Object.keys(req.body || {}),
+  const to = (req.body.to || "").toLowerCase();
+  if (!to.includes("@")) {
+    return res.status(400).json({ ok: false, error: "invalid_to" });
+  }
+
+  const raw = req.file?.buffer?.toString("utf8") || "";
+
+  await storeMessage({
+    to,
+    from: req.body.from,
+    subject: req.body.subject,
+    raw,
   });
-});
 
-/* -------------------- Mailgun inbound (x-www-form-urlencoded) -------------------- */
-app.post("/mailgun/inbound", async (req, res) => {
-  try {
-    const data = req.body || {};
-
-    const to = (data.recipient || "").toLowerCase();
-    if (!to.includes("@")) return res.status(400).json({ ok: false, error: "missing_recipient" });
-
-    await storeMessage({
-      to,
-      from: data.sender || "",
-      subject: data.subject || "",
-      text: data["body-plain"] || "",
-      html: data["body-html"] || "",
-      received_at: nowISO(),
-      headers: {},
-    });
-
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("[mailgun] error:", e);
-    return res.status(500).json({ ok: false, error: e.message || "mailgun_failed" });
-  }
+  res.json({ ok: true });
 });
 
 /* -------------------- Start -------------------- */

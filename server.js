@@ -219,11 +219,6 @@ app.get("/message/:id", async (req, res) => {
   }
 });
 
-// aliases
-app.post("/api/create", (req, res) => app._router.handle(req, res, () => {}));
-app.get("/api/inbox/:local", (req, res) => app._router.handle(req, res, () => {}));
-app.get("/api/message/:id", (req, res) => app._router.handle(req, res, () => {}));
-
 /* -------------------- Incoming from Worker (JSON) -------------------- */
 app.post("/incoming-email", async (req, res) => {
   try {

@@ -337,12 +337,12 @@ app.post(
   async (req, res) => {
     try {
       // ✅ optional auth
-      if (API_KEY) {
-        const sent = (req.headers["x-api-key"] || "").toString().trim();
-        if (!sent || sent !== API_KEY) {
-          return res.status(401).json({ ok: false, error: "unauthorized" });
-        }
-      }
+      // if (API_KEY) {
+      //   const sent = (req.headers["x-api-key"] || "").toString().trim();
+      //   if (!sent || sent !== API_KEY) {
+      //     return res.status(401).json({ ok: false, error: "unauthorized" });
+      //   }
+      // }
 
       const mail = await simpleParser(req.body);
 

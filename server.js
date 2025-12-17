@@ -177,6 +177,39 @@ async function storeMessage({
   return { msgId, local };
 }
 
+
+app.get("/_debug/msg/:id", async (req, res) => {
+  try {
+    const id = (req.params.id || "").trim();
+    const raw = await rGet(messageKey(id));
+    if (!raw) return res.status(404).json({ ok: false, error: "not_found" });
+
+    const m = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return res.json({
+      ok: true,
+      id: m.id,
+      to: m.to,
+      subject: m.subject,
+      has_raw: !!m.raw,
+      raw_len: (m.raw || "").length,
+      attachments: (m.attachments || []).map(a => ({
+        idx: a.idx,
+        filename: a.filename,
+        contentType: a.contentType,
+        size: a.size,
+        disposition: a.disposition,
+        cid: a.cid,
+        stored: a.stored,
+      })),
+    });
+  } catch (e) {
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+
+
+
 /* -------------------- Health / Debug -------------------- */
 app.get("/", (_req, res) => res.json({ ok: true }));
 app.get("/healthz", (_req, res) => res.status(200).send("OK"));

@@ -73,9 +73,64 @@ const MSG_TTL = Number(process.env.MSG_TTL || 600);
 const DOMAIN = process.env.DOMAIN || "temp-mail.gr";
 const API_KEY = (process.env.API_KEY || "").trim();
 
+// attachments (MVP: small-only in Redis)
+const MAX_ATTACH_BYTES = Number(process.env.MAX_ATTACH_BYTES || 2 * 1024 * 1024); // 2MB
+const PUBLIC_API_BASE = (process.env.PUBLIC_API_BASE || "").trim(); // e.g. https://api.temp-mail.gr
+
 const nowISO = () => new Date().toISOString();
 const mailboxKeyFromLocal = (local) => `inbox:${local}`;
 const messageKey = (id) => `msg:${id}`;
+const attachKey = (msgId, idx) => `att:${msgId}:${idx}`;
+
+async function storeAttachments(msgId, attachments = []) {
+  const out = [];
+
+  for (let i = 0; i < attachments.length; i++) {
+    const a = attachments[i] || {};
+    const size = a.size || (a.content?.length || 0);
+
+    const meta = {
+      idx: i,
+      filename: a.filename || `attachment-${i}`,
+      contentType: a.contentType || "application/octet-stream",
+      size,
+      disposition: a.contentDisposition || "attachment", // attachment | inline
+      cid: a.cid || null,
+      stored: "none", // redis | skipped
+    };
+
+    // MVP: store only small attachments in Redis as base64
+    if (a.content && size > 0 && size <= MAX_ATTACH_BYTES) {
+      const b64 = Buffer.from(a.content).toString("base64");
+      await rSetEX(attachKey(msgId, i), b64, MSG_TTL);
+      meta.stored = "redis";
+    } else {
+      meta.stored = "skipped"; // later: store in R2/S3 and keep URL/key here
+    }
+
+    out.push(meta);
+  }
+
+  return out;
+}
+
+// Replace cid: references in HTML to /attachment/:id/:idx (works for stored inline images)
+function resolveCidHtml(html, msgId, atts = [], baseUrl = "") {
+  if (!html) return "";
+  let out = String(html);
+
+  const prefix = baseUrl ? baseUrl.replace(/\/+$/, "") : "";
+
+  for (const a of atts || []) {
+    if (!a?.cid) continue;
+    const cid = String(a.cid).replace(/[<>]/g, "");
+    out = out.replaceAll(
+      `cid:${cid}`,
+      `${prefix}/attachment/${encodeURIComponent(msgId)}/${a.idx}`
+    );
+  }
+  return out;
+}
 
 async function storeMessage({
   id,
@@ -87,6 +142,7 @@ async function storeMessage({
   raw,
   headers,
   received_at,
+  attachments,
 }) {
   const msgId = (id || Math.random().toString(36).slice(2)).toString();
   const toLc = (to || "").toLowerCase().trim();
@@ -102,7 +158,14 @@ async function storeMessage({
     raw: (raw || "").toString(),
     headers: headers || {},
     received_at: received_at || nowISO(),
+    attachments: [],
   };
+
+  // attachments metadata + (small) data to Redis
+  msg.attachments = await storeAttachments(msgId, attachments || []);
+
+  // CID inline images: rewrite HTML to serve from our attachment endpoint
+  msg.html = resolveCidHtml(msg.html, msgId, msg.attachments, PUBLIC_API_BASE);
 
   await rSetEX(messageKey(msgId), JSON.stringify(msg), MSG_TTL);
 
@@ -133,7 +196,7 @@ app.get("/_debug/redis", (_req, res) =>
 );
 
 app.get("/_debug/apikey", (_req, res) => {
-  const k = (process.env.API_KEY || "");
+  const k = process.env.API_KEY || "";
   res.json({ hasKey: !!k, len: k.length, head: k.slice(0, 4), tail: k.slice(-4) });
 });
 
@@ -231,6 +294,7 @@ async function handleMessage(req, res) {
       raw: m.raw || "",
       received_at: m.received_at || m.date || nowISO(),
       headers: m.headers || {},
+      attachments: m.attachments || [],
     });
   } catch (e) {
     console.error("[message] error:", e);
@@ -238,14 +302,55 @@ async function handleMessage(req, res) {
   }
 }
 
+/* -------------------- Attachment download -------------------- */
+async function handleAttachment(req, res) {
+  try {
+    const id = (req.params.id || "").trim();
+    const idx = Number(req.params.idx);
+
+    if (!id) return res.status(400).json({ ok: false, error: "missing_id" });
+    if (!Number.isFinite(idx) || idx < 0)
+      return res.status(400).json({ ok: false, error: "invalid_idx" });
+
+    const rawMsg = await rGet(messageKey(id));
+    if (!rawMsg) return res.status(404).json({ ok: false, error: "not_found" });
+
+    const m = typeof rawMsg === "string" ? JSON.parse(rawMsg) : rawMsg;
+    const meta = (m.attachments || []).find((x) => Number(x.idx) === idx);
+    if (!meta) return res.status(404).json({ ok: false, error: "attachment_not_found" });
+
+    if (meta.stored !== "redis") {
+      return res.status(413).json({ ok: false, error: "attachment_not_stored_here" });
+    }
+
+    const b64 = await rGet(attachKey(id, idx));
+    if (!b64) return res.status(404).json({ ok: false, error: "attachment_data_missing" });
+
+    const buf = Buffer.from(String(b64), "base64");
+
+    res.setHeader("Content-Type", meta.contentType || "application/octet-stream");
+    res.setHeader("Content-Length", String(buf.length));
+
+    const safeName = (meta.filename || "file").replace(/[\r\n"]/g, "_");
+    res.setHeader("Content-Disposition", `attachment; filename="${safeName}"`);
+
+    return res.send(buf);
+  } catch (e) {
+    console.error("[attachment] error:", e);
+    return res.status(500).json({ ok: false, error: e.message || "attachment_failed" });
+  }
+}
+
 app.post("/create", handleCreate);
 app.get("/inbox/:local", handleInbox);
 app.get("/message/:id", handleMessage);
+app.get("/attachment/:id/:idx", handleAttachment);
 
-// /api aliases (σωστά, χωρίς app._router hacks)
+// /api aliases
 app.post("/api/create", handleCreate);
 app.get("/api/inbox/:local", handleInbox);
 app.get("/api/message/:id", handleMessage);
+app.get("/api/attachment/:id/:idx", handleAttachment);
 
 /* -------------------- Incoming from Worker (JSON) -------------------- */
 app.post("/incoming-email", async (req, res) => {
@@ -260,7 +365,18 @@ app.post("/incoming-email", async (req, res) => {
     const { id, to, from, subject, text, html, received_at, headers } = req.body || {};
     if (!to || !from) return res.status(400).json({ ok: false, error: "missing_to_or_from" });
 
-    await storeMessage({ id, to, from, subject, text, html, headers, received_at });
+    await storeMessage({
+      id,
+      to,
+      from,
+      subject,
+      text,
+      html,
+      headers,
+      received_at,
+      attachments: [], // JSON path currently does not include attachments
+    });
+
     return res.json({ ok: true });
   } catch (e) {
     console.error("[incoming-email] error:", e);
@@ -288,6 +404,7 @@ app.post(
         raw: req.body.toString("utf8"),
         headers: Object.fromEntries(mail.headerLines?.map((h) => [h.key, h.line]) || []),
         received_at: nowISO(),
+        attachments: mail.attachments || [],
       });
 
       return res.json({ ok: true });
@@ -312,19 +429,29 @@ app.post("/push", upload.single("raw"), async (req, res) => {
       return res.status(401).json({ ok: false, error: "unauthorized" });
     }
 
-    const to = (req.body.to || "").toLowerCase().trim();
-    if (!to.includes("@")) return res.status(400).json({ ok: false, error: "invalid_to" });
+    const toBody = (req.body.to || "").toLowerCase().trim();
 
     const rawBuf = req.file?.buffer || null;
     const raw = rawBuf ? rawBuf.toString("utf8") : (req.body.raw || "").toString();
+    if (!raw) return res.status(400).json({ ok: false, error: "missing_raw" });
+
+    // parse .eml
+    const mail = await simpleParser(Buffer.from(raw, "utf8"));
+
+    const toParsed = (mail.to?.value?.[0]?.address || mail.to?.text || "").toLowerCase().trim();
+    const to = (toBody || toParsed || "").toString();
+    if (!to.includes("@")) return res.status(400).json({ ok: false, error: "invalid_to" });
 
     await storeMessage({
       to,
-      from: (req.body.from || "").toString(),
-      subject: (req.body.subject || "").toString(),
+      from: (req.body.from || mail.from?.text || "").toString(),
+      subject: (req.body.subject || mail.subject || "").toString(),
+      text: mail.text || "",
+      html: mail.html || "",
       raw,
+      headers: Object.fromEntries(mail.headerLines?.map((h) => [h.key, h.line]) || []),
       received_at: nowISO(),
-      headers: {},
+      attachments: mail.attachments || [],
     });
 
     return res.json({ ok: true });
@@ -364,6 +491,7 @@ app.post("/mailgun/inbound", async (req, res) => {
       html: data["body-html"] || "",
       received_at: nowISO(),
       headers: {},
+      attachments: [], // mailgun would need multipart handling for attachments (future)
     });
 
     return res.json({ ok: true });

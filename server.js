@@ -62,20 +62,19 @@ app.use(
     limit: 120,
     standardHeaders: true,
     legacyHeaders: false,
-    skip: (req) =>
-      req.path === "/" || req.path === "/healthz" || req.path.startsWith("/_debug"),
+    skip: (req) => req.path === "/" || req.path === "/healthz" || req.path.startsWith("/_debug"),
   })
 );
 
 /* -------------------- Helpers -------------------- */
-const INBOX_TTL = Number(process.env.INBOX_TTL || 600);
-const MSG_TTL = Number(process.env.MSG_TTL || 600);
+const INBOX_TTL = Number(process.env.INBOX_TTL || 3600); // ✅ προτείνω 1h
+const MSG_TTL = Number(process.env.MSG_TTL || 3600);     // ✅ προτείνω 1h
 const DOMAIN = process.env.DOMAIN || "temp-mail.gr";
 const API_KEY = (process.env.API_KEY || "").trim();
 
 // attachments (MVP: small-only in Redis)
 const MAX_ATTACH_BYTES = Number(process.env.MAX_ATTACH_BYTES || 2 * 1024 * 1024); // 2MB
-const PUBLIC_API_BASE = (process.env.PUBLIC_API_BASE || "").trim(); // e.g. https://api.temp-mail.gr
+const PUBLIC_API_BASE = (process.env.PUBLIC_API_BASE || "https://api.temp-mail.gr").trim();
 
 const nowISO = () => new Date().toISOString();
 const mailboxKeyFromLocal = (local) => `inbox:${local}`;
@@ -84,7 +83,6 @@ const attachKey = (msgId, idx) => `att:${msgId}:${idx}`;
 
 async function storeAttachments(msgId, attachments = []) {
   const out = [];
-
   for (let i = 0; i < attachments.length; i++) {
     const a = attachments[i] || {};
     const size = a.size || (a.content?.length || 0);
@@ -99,26 +97,23 @@ async function storeAttachments(msgId, attachments = []) {
       stored: "none", // redis | skipped
     };
 
-    // MVP: store only small attachments in Redis as base64
     if (a.content && size > 0 && size <= MAX_ATTACH_BYTES) {
       const b64 = Buffer.from(a.content).toString("base64");
       await rSetEX(attachKey(msgId, i), b64, MSG_TTL);
       meta.stored = "redis";
     } else {
-      meta.stored = "skipped"; // later: store in R2/S3 and keep URL/key here
+      meta.stored = "skipped"; // later: store in R2/S3
     }
 
     out.push(meta);
   }
-
   return out;
 }
 
-// Replace cid: references in HTML to /attachment/:id/:idx (works for stored inline images)
+// Replace cid: references in HTML to /attachment/:id/:idx
 function resolveCidHtml(html, msgId, atts = [], baseUrl = "") {
   if (!html) return "";
   let out = String(html);
-
   const prefix = baseUrl ? baseUrl.replace(/\/+$/, "") : "";
 
   for (const a of atts || []) {
@@ -161,10 +156,7 @@ async function storeMessage({
     attachments: [],
   };
 
-  // attachments metadata + (small) data to Redis
   msg.attachments = await storeAttachments(msgId, attachments || []);
-
-  // CID inline images: rewrite HTML to serve from our attachment endpoint
   msg.html = resolveCidHtml(msg.html, msgId, msg.attachments, PUBLIC_API_BASE);
 
   await rSetEX(messageKey(msgId), JSON.stringify(msg), MSG_TTL);
@@ -177,6 +169,9 @@ async function storeMessage({
   return { msgId, local };
 }
 
+/* -------------------- Health / Debug -------------------- */
+app.get("/", (_req, res) => res.json({ ok: true }));
+app.get("/healthz", (_req, res) => res.status(200).send("OK"));
 
 app.get("/_debug/msg/:id", async (req, res) => {
   try {
@@ -185,14 +180,14 @@ app.get("/_debug/msg/:id", async (req, res) => {
     if (!raw) return res.status(404).json({ ok: false, error: "not_found" });
 
     const m = typeof raw === "string" ? JSON.parse(raw) : raw;
-    return res.json({
+    res.json({
       ok: true,
       id: m.id,
       to: m.to,
       subject: m.subject,
       has_raw: !!m.raw,
       raw_len: (m.raw || "").length,
-      attachments: (m.attachments || []).map(a => ({
+      attachments: (m.attachments || []).map((a) => ({
         idx: a.idx,
         filename: a.filename,
         contentType: a.contentType,
@@ -203,57 +198,7 @@ app.get("/_debug/msg/:id", async (req, res) => {
       })),
     });
   } catch (e) {
-    res.status(500).json({ ok:false, error:e.message });
-  }
-});
-
-
-
-
-/* -------------------- Health / Debug -------------------- */
-app.get("/", (_req, res) => res.json({ ok: true }));
-app.get("/healthz", (_req, res) => res.status(200).send("OK"));
-
-app.get("/_debug/ping", (_req, res) =>
-  res.json({
-    ok: true,
-    t: Date.now(),
-    dev: !!process.env.DEV_MODE,
-    domain: process.env.DOMAIN || null,
-    allowedList: (process.env.FRONTEND_ORIGIN || "*").split(",").map((s) => s.trim()),
-  })
-);
-
-app.get("/_debug/redis", (_req, res) =>
-  res.json({ ok: true, hasUrl: !!redisUrl, hasToken: !!redisToken })
-);
-
-app.get("/_debug/apikey", (_req, res) => {
-  const k = process.env.API_KEY || "";
-  res.json({ hasKey: !!k, len: k.length, head: k.slice(0, 4), tail: k.slice(-4) });
-});
-
-// δείχνει τι headers έρχονται (για να δεις αν περνάει x-api-key κλπ)
-app.get("/_debug/headers", (req, res) => {
-  res.json({ ok: true, headers: req.headers });
-});
-
-app.get("/_debug/selftest", async (_req, res) => {
-  try {
-    const key = `selftest:${Date.now()}`;
-    await rSetEX(key, JSON.stringify({ ok: true }), 30);
-    const got = await rGet(key);
-
-    const lkey = `selflist:${Date.now()}`;
-    await rLPush(lkey, "a");
-    await rLPush(lkey, "b");
-    await rExpire(lkey, 30);
-    const lr = await rLRange(lkey, 0, 9);
-
-    res.json({ ok: true, setexValue: got, list: lr });
-  } catch (e) {
-    console.error("[selftest] error:", e);
-    res.status(500).json({ ok: false, error: e.message, stack: String(e.stack || "") });
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
@@ -295,7 +240,7 @@ async function handleInbox(req, res) {
         from: m.from || "",
         subject: m.subject || "",
         preview: (m.text || m.raw || "").slice(0, 160),
-        received_at: m.received_at || m.date || nowISO(),
+        received_at: m.received_at || nowISO(),
       });
     }
 
@@ -325,7 +270,7 @@ async function handleMessage(req, res) {
       body_plain: m.text || "",
       body_html: m.html || "",
       raw: m.raw || "",
-      received_at: m.received_at || m.date || nowISO(),
+      received_at: m.received_at || nowISO(),
       headers: m.headers || {},
       attachments: m.attachments || [],
     });
@@ -385,44 +330,20 @@ app.get("/api/inbox/:local", handleInbox);
 app.get("/api/message/:id", handleMessage);
 app.get("/api/attachment/:id/:idx", handleAttachment);
 
-/* -------------------- Incoming from Worker (JSON) -------------------- */
-app.post("/incoming-email", async (req, res) => {
-  try {
-    if (API_KEY) {
-      const sent = (req.headers["x-api-key"] || "").toString().trim();
-      if (!sent || sent !== API_KEY) {
-        return res.status(401).json({ ok: false, error: "unauthorized" });
-      }
-    }
-
-    const { id, to, from, subject, text, html, received_at, headers } = req.body || {};
-    if (!to || !from) return res.status(400).json({ ok: false, error: "missing_to_or_from" });
-
-    await storeMessage({
-      id,
-      to,
-      from,
-      subject,
-      text,
-      html,
-      headers,
-      received_at,
-      attachments: [], // JSON path currently does not include attachments
-    });
-
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("[incoming-email] error:", e);
-    return res.status(500).json({ ok: false, error: e.message || "incoming_failed" });
-  }
-});
-
-/* -------------------- Incoming RAW email (HTTP body) -------------------- */
+/* -------------------- Incoming RAW email (from Worker) -------------------- */
 app.post(
   "/cloudflare/inbound",
   express.raw({ type: () => true, limit: "25mb" }),
   async (req, res) => {
     try {
+      // ✅ optional auth
+      if (API_KEY) {
+        const sent = (req.headers["x-api-key"] || "").toString().trim();
+        if (!sent || sent !== API_KEY) {
+          return res.status(401).json({ ok: false, error: "unauthorized" });
+        }
+      }
+
       const mail = await simpleParser(req.body);
 
       const to = (mail.to?.value?.[0]?.address || "").toLowerCase();
@@ -447,92 +368,6 @@ app.post(
     }
   }
 );
-
-/* -------------------- PUSH (multipart/form-data) -------------------- */
-const upload = multer({ limits: { fileSize: 25 * 1024 * 1024 } });
-
-app.post("/push", upload.single("raw"), async (req, res) => {
-  try {
-    // δέχεται κλειδί είτε ως field είτε ως header
-    const keyFromBody = (req.body?.api_key || "").toString().trim();
-    const keyFromHeader = (req.headers["x-api-key"] || "").toString().trim();
-    const sentKey = keyFromBody || keyFromHeader;
-
-    if (API_KEY && sentKey !== API_KEY) {
-      return res.status(401).json({ ok: false, error: "unauthorized" });
-    }
-
-    const toBody = (req.body.to || "").toLowerCase().trim();
-
-    const rawBuf = req.file?.buffer || null;
-    const raw = rawBuf ? rawBuf.toString("utf8") : (req.body.raw || "").toString();
-    if (!raw) return res.status(400).json({ ok: false, error: "missing_raw" });
-
-    // parse .eml
-    const mail = await simpleParser(Buffer.from(raw, "utf8"));
-
-    const toParsed = (mail.to?.value?.[0]?.address || mail.to?.text || "").toLowerCase().trim();
-    const to = (toBody || toParsed || "").toString();
-    if (!to.includes("@")) return res.status(400).json({ ok: false, error: "invalid_to" });
-
-    await storeMessage({
-      to,
-      from: (req.body.from || mail.from?.text || "").toString(),
-      subject: (req.body.subject || mail.subject || "").toString(),
-      text: mail.text || "",
-      html: mail.html || "",
-      raw,
-      headers: Object.fromEntries(mail.headerLines?.map((h) => [h.key, h.line]) || []),
-      received_at: nowISO(),
-      attachments: mail.attachments || [],
-    });
-
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("[push] error:", e);
-    return res.status(500).json({ ok: false, error: e.message || "push_failed" });
-  }
-});
-
-// Debug endpoint για να δεις τι φτάνει πραγματικά στο /push
-app.post("/_debug/pushcheck", upload.single("raw"), (req, res) => {
-  res.json({
-    ok: true,
-    env_api_key_head: API_KEY ? API_KEY.slice(0, 4) : null,
-    env_api_key_tail: API_KEY ? API_KEY.slice(-4) : null,
-    body_api_key: req.body?.api_key || null,
-    header_x_api_key: req.headers["x-api-key"] || null,
-    content_type: req.headers["content-type"] || null,
-    has_file: !!req.file,
-    file_size: req.file?.size || 0,
-    body_keys: Object.keys(req.body || {}),
-  });
-});
-
-/* -------------------- Mailgun inbound (x-www-form-urlencoded) -------------------- */
-app.post("/mailgun/inbound", async (req, res) => {
-  try {
-    const data = req.body || {};
-    const to = (data.recipient || "").toLowerCase();
-    if (!to.includes("@")) return res.status(400).json({ ok: false, error: "missing_recipient" });
-
-    await storeMessage({
-      to,
-      from: data.sender || "",
-      subject: data.subject || "",
-      text: data["body-plain"] || "",
-      html: data["body-html"] || "",
-      received_at: nowISO(),
-      headers: {},
-      attachments: [], // mailgun would need multipart handling for attachments (future)
-    });
-
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("[mailgun] error:", e);
-    return res.status(500).json({ ok: false, error: e.message || "mailgun_failed" });
-  }
-});
 
 /* -------------------- Start -------------------- */
 app.listen(WEB_PORT, () => {

@@ -421,10 +421,7 @@ app.post(
   express.raw({ type: () => true, limit: "25mb" }),
   async (req, res) => {
     try {
-      const mail = await simpleParser(req.body, {
-  decodeStrings: true,
-  Iconv: (await import('iconv-lite')).default,
-});
+      const mail = await simpleParser(Buffer.from(req.body));
 
       const to = (mail.to?.value?.[0]?.address || "").toLowerCase();
       if (!to.includes("@")) return res.status(400).json({ ok: false, error: "missing_to" });

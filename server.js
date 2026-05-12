@@ -265,9 +265,7 @@ async function handleCreate(_req, res) {
 
   try {
     await rDel(key);
-    await rLPush(key, "__init__");
-    await rLTrim(key, 1, -1);
-    await rExpire(key, INBOX_TTL);
+    await rSetEX(`${key}:created`, "1", INBOX_TTL);
 
     return res.json({ ok: true, email, local, expires_in: INBOX_TTL });
   } catch (e) {

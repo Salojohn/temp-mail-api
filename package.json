@@ -12,5 +12,6 @@
     "mailparser": "^3.7.1",
     "multer": "^2.0.2",
     "smtp-server": "^3.13.4"
+    "iconv-lite": "^0.6.3"
   }
 }
